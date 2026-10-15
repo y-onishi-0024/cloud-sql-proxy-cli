@@ -32,6 +32,8 @@ type Artifact struct {
 }
 type App struct {
 	outMu, errMu                          sync.Mutex
+	proxyPortsMu                          sync.Mutex
+	proxyPorts                            map[int]bool
 	Paths                                 Paths
 	In                                    io.Reader
 	Out, Err                              io.Writer

@@ -268,6 +268,35 @@ func choosePort(db string, explicit int) (int, error) {
 	return 0, fmt.Errorf("127.0.0.1:%d のポートを利用できません。別の --port を指定してください", start)
 }
 
+// 子がまだbindしていない間も予約し、同じAppの並行起動による衝突を防ぐ。
+func (a *App) reserveProxyPort(v Instance, explicit int) (int, func(), error) {
+	a.proxyPortsMu.Lock()
+	defer a.proxyPortsMu.Unlock()
+	port, err := a.profilePort(v, explicit, a.proxyPorts)
+	if err != nil {
+		return 0, nil, err
+	}
+	if a.proxyPorts == nil {
+		a.proxyPorts = make(map[int]bool)
+	}
+	a.proxyPorts[port] = true
+	return port, func() {
+		a.proxyPortsMu.Lock()
+		defer a.proxyPortsMu.Unlock()
+		delete(a.proxyPorts, port)
+	}, nil
+}
+
+func (a *App) reservedProxyPorts() map[int]bool {
+	a.proxyPortsMu.Lock()
+	defer a.proxyPortsMu.Unlock()
+	ports := make(map[int]bool, len(a.proxyPorts))
+	for port := range a.proxyPorts {
+		ports[port] = true
+	}
+	return ports
+}
+
 func (a *App) Connect(ctx context.Context, v Instance, opt ConnectOptions) (retErr error) {
 	if ctx.Err() != nil {
 		return ctx.Err()
@@ -279,10 +308,12 @@ func (a *App) Connect(ctx context.Context, v Instance, opt ConnectOptions) (retE
 	if err != nil {
 		return err
 	}
-	port, err := a.profilePort(v, opt.Port)
+	port, releasePort, err := a.reserveProxyPort(v, opt.Port)
 	if err != nil {
 		return diagnosticError{a.failureContext(ctx, "local", "Proxy起動", v, opt.PrivateIP), err}
 	}
+	// 後から登録する子のWait・管理記録削除が完了してから解放する。
+	defer releasePort()
 	fc := a.failureContext(ctx, "proxy", "Cloud SQLへの接続", v, opt.PrivateIP)
 	progress := opt.Progress
 	if progress == nil {

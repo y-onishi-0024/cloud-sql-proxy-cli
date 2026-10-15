@@ -178,16 +178,16 @@ func TestProfilePortConflicts(t *testing.T) {
 	if err = a.AddProfile(context.Background(), p); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = a.profilePort(p.Instance, 0); err == nil || !strings.Contains(err.Error(), "csql status") {
+	if _, err = a.profilePort(p.Instance, 0, nil); err == nil || !strings.Contains(err.Error(), "csql status") {
 		t.Fatalf("使用中を別Portへ回避: %v", err)
 	}
-	if _, err = a.profilePort(p.Instance, p.Port+1); err == nil {
+	if _, err = a.profilePort(p.Instance, p.Port+1, nil); err == nil {
 		t.Fatal("保存済みPortと異なる明示Portを許可")
 	}
 	if err = l.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if port, err := a.profilePort(p.Instance, 0); err != nil || port != p.Port {
+	if port, err := a.profilePort(p.Instance, 0, nil); err != nil || port != p.Port {
 		t.Fatalf("予約を復元できない: %d %v", port, err)
 	}
 }
