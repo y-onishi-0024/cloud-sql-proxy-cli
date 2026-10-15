@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,6 +12,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -302,6 +304,27 @@ func (a *App) profilePort(v Instance, explicit int, unavailable map[int]bool) (i
 	return availableProfilePort(v, explicit, rows, unavailable)
 }
 
+// 出力形式・拡張子を画面選択と自動保存先で共用する。
+var exportTools = []struct{ format, label, suffix string }{
+	{"pgadmin", "pgAdmin", ".json"},
+	{"dbeaver", "DBeaver", ".csv"},
+	{"a5", "A5:SQL Mk-2", ".a5dblist"},
+	{"uri", "接続URI", ".txt"},
+}
+
+func exportGuide(format string) string {
+	switch format {
+	case "pgadmin":
+		return "pgAdmin: Tools → Import/Export Serversで取込み（既存サーバーの削除は無効）"
+	case "dbeaver":
+		return "DBeaver: File → Import → Third Party Configuration → Custom。DBドライバーを選び、CSV・UTF-8で取込みます"
+	case "a5":
+		return "A5: データベース → データベースの追加と削除 → インポート。パスワードはA5側で入力してください"
+	default:
+		return "接続URI: 対応するDBツールに取り込んでください。パスワードはDBツール側で入力します"
+	}
+}
+
 func profileExport(p Profile, format string) ([]byte, error) {
 	if err := validateProfile(p); err != nil {
 		return nil, err
@@ -313,6 +336,37 @@ func profileExport(p Profile, format string) ([]byte, error) {
 		}
 		server := map[string]any{"Name": "csql / " + p.Project + " / " + p.Name, "Group": "csql", "Host": "127.0.0.1", "Port": p.Port, "MaintenanceDB": p.Database, "Username": p.Username, "SSLMode": "disable", "ConnectionParameters": map[string]string{"sslmode": "disable"}}
 		return json.MarshalIndent(map[string]any{"Servers": map[string]any{"1": server}}, "", "  ")
+	case "dbeaver":
+		// DBeaverのCustom取り込み用。引用は標準CSVへ任せ、driverは取り込み時に選択する。
+		var data bytes.Buffer
+		writer := csv.NewWriter(&data)
+		writer.UseCRLF = true
+		if err := writer.WriteAll([][]string{{"name", "host", "port", "database", "user"}, {"csql / " + p.Project + " / " + p.Name, "127.0.0.1", strconv.Itoa(p.Port), p.Database, p.Username}}); err != nil {
+			return nil, err
+		}
+		return data.Bytes(), nil
+	case "a5":
+		// 接続文字列の区切りや引用の意味を持つ値は、別プロパティとして解釈させない。
+		if strings.ContainsAny(p.Database+p.Username, ";\"") {
+			return nil, fmt.Errorf("A5形式ではDB名・ユーザー名にセミコロンや二重引用符を含められません。DBeaver形式またはURIを使用してください")
+		}
+		provider := ""
+		switch {
+		case strings.HasPrefix(p.DatabaseVersion, "POSTGRES"):
+			provider = "PostgreSQL"
+		case strings.HasPrefix(p.DatabaseVersion, "MYSQL"):
+			provider = "MySQL"
+		case strings.HasPrefix(p.DatabaseVersion, "SQLSERVER"):
+			provider = "SQL Server"
+		default:
+			return nil, fmt.Errorf("このDB種別のA5出力は未対応です")
+		}
+		// BOMで文字コードを明示し、日本語もWindowsの既定ANSIへ依存させない。
+		data := fmt.Sprintf("\ufeffcsql/%s/%s=__ConnectionType=Internal;ProviderName=%s;ServerName=127.0.0.1;Port=%d;Database=%s;UserName=%s;", p.Project, p.Name, provider, p.Port, p.Database, p.Username)
+		if provider == "PostgreSQL" {
+			data += "ProtocolVersion=30;SSLMode=Disable;"
+		}
+		return []byte(data + "\r\n"), nil
 	case "uri":
 		scheme := ""
 		switch {
@@ -329,7 +383,7 @@ func profileExport(p Profile, format string) ([]byte, error) {
 		}
 		return []byte(u.String()), nil
 	default:
-		return nil, usageError{fmt.Errorf("--format pgadmin|uri を指定してください")}
+		return nil, usageError{fmt.Errorf("--format pgadmin|dbeaver|a5|uri を指定してください")}
 	}
 }
 func writeProfileExport(path string, b []byte) (retErr error) {
@@ -349,7 +403,10 @@ func writeProfileExport(path string, b []byte) (retErr error) {
 			_ = os.Remove(path)
 		}
 	}()
-	_, retErr = f.Write(append(b, '\n'))
+	if len(b) == 0 || b[len(b)-1] != '\n' {
+		b = append(b, '\n')
+	}
+	_, retErr = f.Write(b)
 	return retErr
 }
 
@@ -434,7 +491,7 @@ func (a *App) profileCommand() *cobra.Command {
 		}
 		return a.RemoveProfile(c.Context(), p.Name)
 	}}
-	export := &cobra.Command{Use: "export NAME", Short: "pgAdmin JSON・接続URIを出力", Args: argCount(1), RunE: func(c *cobra.Command, args []string) error {
+	export := &cobra.Command{Use: "export NAME", Short: "DBツール用の接続設定・URIを出力", Args: argCount(1), RunE: func(c *cobra.Command, args []string) error {
 		rows, err := a.LoadProfiles()
 		if err != nil {
 			return err
@@ -456,10 +513,13 @@ func (a *App) profileCommand() *cobra.Command {
 			fmt.Fprintln(a.stdout(), "出力しました: "+output)
 			return nil
 		}
-		_, err = fmt.Fprintln(a.stdout(), string(b))
+		if len(b) == 0 || b[len(b)-1] != '\n' {
+			b = append(b, '\n')
+		}
+		_, err = a.stdout().Write(b)
 		return err
 	}}
-	export.Flags().String("format", "", "出力形式（pgadmin|uri）")
+	export.Flags().String("format", "", "出力形式（pgadmin|dbeaver|a5|uri）")
 	export.Flags().String("output", "", "新規出力ファイル（省略時は標準出力）")
 	root.AddCommand(add, list, remove, export)
 	return root

@@ -182,7 +182,7 @@ csql profile export dev --format pgadmin --output ./dev-servers.json
 ```
 
 初回だけpgAdminの **Tools → Import/Export Servers** からJSONを取り込みます。**Remove all the existing servers? は無効のまま**対象だけ追加してください。パスワードはJSONに含めず、pgAdmin側で入力・管理します。次回からは`csql --profile dev`を起動して、登録済みの接続を開けます。同じJSONを毎回取り込むと重複する可能性があります。
-接続画面でEを押すと、`csql`を起動したフォルダの`csql-設定名-pgadmin.json`を保存先として自動入力します。Enterだけで保存でき、必要ならパスを編集できます。同名のファイル・ディレクトリ・リンクがある場合は`-2`、`-3`…を付け、既存ファイルは上書きしません。Escで戻った場合は出力しません。保存完了後も出力先を表示します。
+接続画面でE（エクスポート）を押してpgAdminを選ぶと、`csql`を起動したフォルダの`csql-設定名-pgadmin.json`を保存先として自動入力します。Enterだけで保存でき、必要ならパスを編集できます。同名のファイル・ディレクトリ・リンクがある場合は`-2`、`-3`…を付け、既存ファイルは上書きしません。Escで戻った場合は出力しません。保存完了後も出力先を表示します。
 出力先は同じ端末の`127.0.0.1`です。Dockerや別サーバー上のpgAdminでは、同じアドレスでこの端末を参照できません。
 
 ### 他のDBツール
@@ -192,7 +192,27 @@ csql profile export dev --format uri
 ```
 
 パスワードを含まないPostgreSQL/MySQLの接続URIを表示します。対応するDBツールで取り込むか、表示したHost/Port/DB/Userを初回設定に使ってください。SQL Serverの汎用URI出力は未対応です。
-接続中の画面でもEでpgAdmin JSON、UでURIを表示・新規ファイルへ出力できます。長いURIは上のコマンドやファイル出力から全体をコピーできます。出力先の既存ファイルは上書きしません。
+接続詳細のE（エクスポート）からpgAdmin・DBeaver・A5:SQL Mk-2・接続URIを選択できます。↑↓またはTabで選び、Enterで出力先へ進みます。保存先はすべて自動入力され、Enterだけで新規ファイルへ出力できます。出力先のEscはツール選択へ、その画面のEscは接続詳細へ戻ります。長いURIは上のコマンドやファイル出力から全体をコピーできます。出力先の既存ファイルは上書きしません。
+
+### DBeaver
+
+```sh
+csql profile export dev --format dbeaver --output ./dev-dbeaver.csv
+```
+
+DBeaverの **File → Import → Third Party Configuration → Custom** から、対象DBのドライバーを選び、CSV・UTF-8を指定して取り込みます。PostgreSQL・MySQL・SQL Server向けのHost/Port/DB/Userを出力します。パスワードはDBeaver側で入力してください。画面から出力する場合の保存先は`csql-設定名-dbeaver.csv`です。
+取り込み手順と列名は[DBeaver公式ドキュメント](https://dbeaver.com/docs/dbeaver/Admin-Manage-Connections/)に従います。
+
+### A5:SQL Mk-2
+
+```sh
+csql profile export dev --format a5 --output ./dev-a5.a5dblist
+```
+
+A5の **データベース → データベースの追加と削除 → インポート** から読み込みます。PostgreSQL・MySQL・SQL Server向けの接続一覧をUTF-8 BOM付き・CRLFで出力し、パスワードは含めません。文字列の誤解釈を避けるため、DB名・ユーザー名にセミコロンまたは二重引用符が含まれる場合はA5出力を拒否します。
+画面から出力する場合の保存先は`csql-設定名-a5.a5dblist`です。A5はWindows用なので、通常は同じWindows端末でcsqlを起動してください。登録形式は[作者による接続文字列の説明](https://a5m2.mmatsubara.com/wp/?bbp_reps=1&bbp_user=1&paged=73)を参照しています。実際のA5での取り込みは、このMac上の自動検証に含みません。
+
+ツール選択で対象DBに対応しない形式を選んだ場合は、理由を表示し、別の形式を選び直せます。保存完了後はツールごとに取り込み手順を表示します。既存ファイルがある場合は`-2`などを付けて候補を提示し、確認後に生じた競合でも上書きしません。
 
 ```sh
 csql profile remove dev

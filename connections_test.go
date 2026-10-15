@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/csv"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -86,6 +87,19 @@ func (h *connectionsHarness) key(key string) {
 	h.update(msg)
 }
 
+// 画面の共通エクスポート入口を通して、対象ツールを選択する。
+func (h *connectionsHarness) exportTool(format string) {
+	h.key("e")
+	for _, tool := range exportTools {
+		if tool.format == format {
+			h.key("enter")
+			return
+		}
+		h.key("down")
+	}
+	h.t.Fatal("未知の出力形式: ", format)
+}
+
 func (h *connectionsHarness) until(text string) {
 	h.t.Helper()
 	h.pumpUntil(func() bool { return strings.Contains(h.m.View(), text) }, text)
@@ -125,7 +139,7 @@ func TestConnectionsAddSwitchAndStop(t *testing.T) {
 		awaitProxyPort(t, row.Port)
 	}
 	h.key("esc")
-	h.m.updateVersion = "v0.4.0"
+	h.m.updateVersion = "v0.5.0"
 	if !strings.Contains(h.m.View(), "稼働 2件") {
 		t.Fatal("更新通知で稼働件数を喪失")
 	}
@@ -188,10 +202,11 @@ func TestConnectionsDelayedResultsAndRetry(t *testing.T) {
 	p := other.effectiveProfile()
 	p.Name, p.Database, p.Username = "analytics", "analytics-db", "analyst"
 	h.m.startConnection(p)
-	h.key("u")
+	h.exportTool("uri")
 	if !strings.Contains(h.m.exportData, "analyst@127.0.0.1") || !strings.Contains(h.m.exportData, "analytics-db") {
 		t.Fatal("再利用したプロファイルが出力へ反映されない")
 	}
+	h.key("esc")
 	h.key("esc")
 	h.m.startConnection(Profile{Instance: p.Instance})
 	if other.profile.Name != "analytics" {
@@ -241,8 +256,8 @@ func TestConnectionsSaveAndExportOwnership(t *testing.T) {
 			if p.Instance.ConnectionName != first.profile.ConnectionName || p.Database != "業務/db" || p.Username != "reader" || p.Port != actualPort {
 				t.Fatalf("保存対象が混線: %+v", p)
 			}
-			for _, format := range []string{"pgadmin", "uri"} {
-				h.m.beginExport(format)
+			for _, format := range []string{"pgadmin", "dbeaver", "a5", "uri"} {
+				h.exportTool(format)
 				dir, err := filepath.EvalSymlinks(t.TempDir())
 				if err != nil {
 					t.Fatal(err)
@@ -269,9 +284,19 @@ func TestConnectionsSaveAndExportOwnership(t *testing.T) {
 					if row.MaintenanceDB != "業務/db" || row.Username != "reader" || row.Port != actualPort {
 						t.Fatalf("JSON対象が混線: %s", data)
 					}
+				} else if format == "dbeaver" {
+					rows, err := csv.NewReader(strings.NewReader(string(data))).ReadAll()
+					if err != nil || rows[1][2] != fmt.Sprint(actualPort) || rows[1][3] != "業務/db" || rows[1][4] != "reader" {
+						t.Fatalf("CSV対象が混線: %s %v", data, err)
+					}
+				} else if format == "a5" {
+					if !strings.Contains(string(data), fmt.Sprintf("Port=%d;Database=業務/db;UserName=reader;", actualPort)) {
+						t.Fatalf("A5対象が混線: %s", data)
+					}
 				} else if !strings.Contains(string(data), fmt.Sprintf("reader@127.0.0.1:%d/", actualPort)) || !strings.Contains(string(data), "%E6%A5%AD%E5%8B%99%2Fdb") {
 					t.Fatalf("URI対象が混線: %s", data)
 				}
+				h.key("esc")
 				h.key("esc")
 			}
 		})
@@ -395,7 +420,7 @@ func TestConnectionsEditingDuringRetry(t *testing.T) {
 	h.m.state = "connecting"
 	// 停止を開始した直後もCtrl+S/Eは旧試行の編集へ入らず、待機理由を案内する。
 	h.m.stopConnection(c.id, true)
-	for _, key := range []string{"ctrl+s", "e", "u"} {
+	for _, key := range []string{"ctrl+s", "e"} {
 		h.key(key)
 		if h.m.state != "connecting" || !strings.Contains(h.m.message, "停止") {
 			t.Fatalf("停止待ちの%sで旧試行を編集: %s", key, h.m.state)
@@ -403,7 +428,7 @@ func TestConnectionsEditingDuringRetry(t *testing.T) {
 	}
 	// 次の試行が始まっても、実ポート確定前は出力を作らない。
 	h.m.finishConnection(connectionFinished{id: 1, attempt: 1, err: context.Canceled})
-	for _, key := range []string{"ctrl+s", "e", "u"} {
+	for _, key := range []string{"ctrl+s", "e"} {
 		h.key(key)
 		if h.m.state != "connecting" || !strings.Contains(h.m.message, "Port") {
 			t.Fatalf("起動待ちの%sで未確定Portを出力", key)

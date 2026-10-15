@@ -272,6 +272,7 @@ type connectUI struct {
 	diagnostic                        *Diagnostic
 	showLogs                          bool
 	exportFormat, exportData          string
+	exportCursor                      int
 	exit                              bool
 	resultErr                         error
 	notices                           []string
@@ -514,74 +515,108 @@ func (m *connectUI) saveForm() tea.Cmd {
 		return result
 	})
 }
+
+// Eで対象接続を固定し、ツール選択中の背景終了でも別接続へ切り替えない。
+func (m *connectUI) openExportMenu() {
+	c := m.selectedConnection()
+	if c == nil {
+		return
+	}
+	if c.stopping {
+		m.message = "停止処理の完了を待ってから出力してください"
+		return
+	}
+	if c.running && (c.progress == nil || c.progress.Snapshot().Session.Port == 0) {
+		m.message = "Portの確定を待ってから出力してください"
+		return
+	}
+	p := c.effectiveProfile()
+	if p.Name == "" {
+		m.openForm(p)
+		m.message = "先に接続設定を保存してください。保存後にEで出力できます"
+		return
+	}
+	m.editProfile = p
+	m.editOwner, m.editAttempt = c.id, c.attempt
+	m.exportCursor = 0
+	m.state = "exportTools"
+	m.message = ""
+	m.exportData = ""
+}
 func (m *connectUI) beginExport(format string) {
 	p := m.editProfile
-	if c := m.selectedConnection(); c != nil && m.state == "connecting" {
-		p = c.effectiveProfile()
-		if c.stopping {
-			m.message = "停止処理の完了を待ってから出力してください"
+	fromMenu := m.state == "exportTools"
+	if !fromMenu {
+		if c := m.selectedConnection(); c != nil && m.state == "connecting" {
+			p = c.effectiveProfile()
+			if c.stopping {
+				m.message = "停止処理の完了を待ってから出力してください"
+				return
+			}
+			if c.running && (c.progress == nil || c.progress.Snapshot().Session.Port == 0) {
+				m.message = "Portの確定を待ってから出力してください"
+				return
+			}
+		}
+		if p.Name == "" {
+			m.openForm(p)
+			m.message = "先に接続設定を保存してください"
 			return
 		}
-		if c.running && (c.progress == nil || c.progress.Snapshot().Session.Port == 0) {
-			m.message = "Portの確定を待ってから出力してください"
-			return
-		}
-	}
-	if p.Name == "" {
-		m.message = "先に接続設定を保存してください"
-		m.openForm(p)
-		return
 	}
 	data, err := profileExport(p, format)
 	if err != nil {
 		m.message = err.Error()
 		return
 	}
+	dir, err := os.Getwd()
+	if err != nil {
+		m.message = "出力先フォルダを確認できません: " + safeLog(err.Error())
+		return
+	}
+	suffix := ""
+	for _, tool := range exportTools {
+		if tool.format == format {
+			suffix = tool.suffix
+			break
+		}
+	}
+	base := filepath.Join(dir, "csql-"+p.Name+"-"+format)
 	path := ""
-	label := "新規出力パス（空で戻る）"
-	if format == "pgadmin" {
-		dir, err := os.Getwd()
+	// 候補提示と書込時の両方で競合を検出し、既存ファイル・dir・linkを保持する。
+	for i := 0; i < 1000; i++ {
+		candidate := base + suffix
+		if i > 0 {
+			candidate = fmt.Sprintf("%s-%d%s", base, i+1, suffix)
+		}
+		_, err := os.Lstat(candidate)
+		if os.IsNotExist(err) {
+			path = candidate
+			break
+		}
 		if err != nil {
-			m.message = "出力先フォルダを確認できません: " + safeLog(err.Error())
+			m.message = "出力先を確認できません: " + safeLog(err.Error())
 			return
 		}
-		// 既存ファイル・ディレクトリ・リンクを避けた候補だけを提示する。
-		// 保存時も共通のO_EXCL検査を使い、確認後に生じた競合を上書きしない。
-		base := filepath.Join(dir, "csql-"+p.Name+"-pgadmin")
-		for i := 0; i < 1000; i++ {
-			candidate := base + ".json"
-			if i > 0 {
-				candidate = fmt.Sprintf("%s-%d.json", base, i+1)
-			}
-			_, err := os.Lstat(candidate)
-			if os.IsNotExist(err) {
-				path = candidate
-				break
-			}
-			if err != nil {
-				m.message = "出力先を確認できません: " + safeLog(err.Error())
-				return
-			}
-		}
-		if path == "" {
-			m.message = "出力先の同名ファイルが多いため、自動設定できません。別のフォルダからcsqlを起動してください"
-			return
-		}
-		label = "出力パス（Enterで保存・編集可 / Escで戻る）"
+	}
+	if path == "" {
+		m.message = "出力先の同名ファイルが多いため、自動設定できません。別のフォルダからcsqlを起動してください"
+		return
 	}
 	m.formBack = m.state
 	if m.formBack == "form" {
 		m.formBack = "list"
 	}
-	m.editProfile = p
-	m.editOwner, m.editAttempt = 0, 0
-	if c := m.selectedConnection(); c != nil && m.state == "connecting" {
-		m.editOwner, m.editAttempt = c.id, c.attempt
+	if !fromMenu {
+		m.editProfile = p
+		m.editOwner, m.editAttempt = 0, 0
+		if c := m.selectedConnection(); c != nil && m.state == "connecting" {
+			m.editOwner, m.editAttempt = c.id, c.attempt
+		}
 	}
-	m.exportFormat = format
-	m.exportData = string(data)
+	m.exportFormat, m.exportData = format, string(data)
 	m.state = "export"
-	m.fields = []formField{{label: label, value: path, pos: len([]rune(path))}}
+	m.fields = []formField{{label: "出力パス（Enterで保存・編集可 / Escで戻る）", value: path, pos: len([]rune(path))}}
 	m.focus = 0
 	m.message = ""
 }
@@ -714,7 +749,7 @@ func (m *connectUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if v.err != nil {
 				m.message = safeLog(v.err.Error())
 			} else {
-				m.message = "ファイルへ出力しました: " + v.data + "\npgAdminは初回だけTools → Import/Export Serversで取込み（既存サーバーの削除は無効）"
+				m.message = "ファイルへ出力しました: " + v.data + "\n" + exportGuide(m.exportFormat)
 			}
 		}
 		return m, nil
@@ -762,6 +797,20 @@ func (m *connectUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, m.saveForm()
 			default:
 				editText(&m.fields[m.focus].value, &m.fields[m.focus].pos, v)
+			}
+			return m, nil
+		}
+		if m.state == "exportTools" {
+			switch key {
+			case "esc":
+				m.state = "connecting"
+				m.message = ""
+			case "up", "shift+tab":
+				m.exportCursor = max(0, m.exportCursor-1)
+			case "down", "tab":
+				m.exportCursor = min(len(exportTools)-1, m.exportCursor+1)
+			case "enter":
+				m.beginExport(exportTools[m.exportCursor].format)
 			}
 			return m, nil
 		}
@@ -908,9 +957,7 @@ func (m *connectUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				c.showLogs = !c.showLogs
 				c.recoveryPage = 0
 			case "e", "E":
-				m.beginExport("pgadmin")
-			case "u", "U":
-				m.beginExport("uri")
+				m.openExportMenu()
 			case "ctrl+s":
 				m.openForm(c.effectiveProfile())
 			}
@@ -990,7 +1037,7 @@ func (m *connectUI) View() string {
 		return v.choices(c)
 	}
 	title, badge := "接続ステータス", paint("● 処理中", tuiAccent, v.color)
-	footer = []string{"L ログ  E pgAdmin  U URI  Ctrl+S 保存  R 再試行", "N 追加  S 停止  Esc 接続一覧  Ctrl+C 全接続停止"}
+	footer = []string{"L ログ  E エクスポート  Ctrl+S 保存  R 再試行", "N 追加  S 停止  Esc 接続一覧  Ctrl+C 全接続停止"}
 	var lines []string
 	spin := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}[m.frame%10]
 	switch m.state {
@@ -1012,16 +1059,35 @@ func (m *connectUI) View() string {
 			lines = append(lines, marker+f.label+"  "+text)
 		}
 		footer = []string{"Tab / ↑↓ 項目移動  Enter 次へ/保存  Ctrl+S 保存", "Esc 戻る  Ctrl+C この画面の全接続停止"}
+	case "exportTools":
+		title = "エクスポート先ツール"
+		badge = paint("↓ 選択", tuiAccent, v.color)
+		lines = []string{"出力形式を選んでください", ""}
+		for i, tool := range exportTools {
+			label := "  " + tool.label + "  (" + tool.suffix + ")"
+			if i == m.exportCursor {
+				label = paint("› "+tool.label+"  ("+tool.suffix+")", tuiAccent, v.color)
+			}
+			lines = append(lines, label)
+		}
+		if m.message == "" {
+			lines = append(lines, "", fmt.Sprintf("設定 %s / 127.0.0.1:%d", m.editProfile.Name, m.editProfile.Port))
+		}
+		footer = []string{"↑↓ / Tab 選択  Enter 次へ", "Esc 接続詳細へ  Ctrl+C この画面の全接続停止"}
 	case "export":
 		title = "接続情報を出力"
 		badge = paint("↓ "+m.exportFormat, tuiAccent, v.color)
 		// 出力先と操作を先に置き、長いJSONでも入力欄を隠さない。
 		lines = []string{m.fields[0].label, inputView(m.fields[0].value, m.fields[0].pos, width-6), ""}
 		if m.message != "" {
-			lines = append(lines, ansi.Wrap(safeLog(m.message), width-4, ""), "")
+			text := m.message
+			if strings.HasPrefix(text, "ファイルへ出力しました:") {
+				text = "ファイルへ出力しました\n" + exportGuide(m.exportFormat)
+			}
+			lines = append(lines, ansi.Wrap(safeLog(text), width-4, ""), "")
 		}
 		room := max(0, height-6-len(strings.Split(strings.Join(lines, "\n"), "\n"))-1)
-		preview := strings.Split(m.exportData, "\n")
+		preview := strings.Split(strings.TrimPrefix(m.exportData, "\ufeff"), "\n")
 		if len(preview) > room {
 			preview = append(preview[:room], "… 全体をファイルへ出力します")
 		}
@@ -1091,7 +1157,7 @@ func (m *connectUI) View() string {
 	if m.message != "" && m.state != "export" && !recoveryVisible {
 		lines = append(lines, "", ansi.Wrap(safeLog(m.message), width-4, ""))
 	}
-	if current.ConnectionName != "" && m.state != "form" && m.state != "export" && m.state != "error" {
+	if current.ConnectionName != "" && m.state != "form" && m.state != "export" && m.state != "exportTools" && m.state != "error" {
 		lines = append(lines, "", paint(current.Project+" / "+current.Instance.Name, tuiMuted, v.color), current.Region+" · "+current.DatabaseVersion, "DB "+current.Database+" / ユーザー "+current.Username)
 	}
 	if showLogs && progress != nil && diagnostic == nil {

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -276,5 +277,84 @@ func TestProfilesConcurrentProcesses(t *testing.T) {
 	rows, err := a.LoadProfiles()
 	if err != nil || len(rows) != 2 {
 		t.Fatalf("同時保存を喪失: %+v %v", rows, err)
+	}
+}
+
+// DBツールへ渡すファイルが、実ポート・日本語・引用符を壊さずパスワードを含めないことをCLIから確認する。
+func TestProfileToolExports(t *testing.T) {
+	for _, db := range []struct{ version, provider string }{{"POSTGRES_18", "PostgreSQL"}, {"MYSQL_8_0", "MySQL"}, {"SQLSERVER_2019_STANDARD", "SQL Server"}} {
+		t.Run(db.provider, func(t *testing.T) {
+			a, out, errs := testApp(t)
+			p := Profile{Name: "dev", Instance: testInstance(), Database: "業務/db", Username: "reader@team", Port: 55431}
+			p.DatabaseVersion = db.version
+			if err := a.AddProfile(context.Background(), p); err != nil {
+				t.Fatal(err)
+			}
+			if code := a.Run(context.Background(), []string{"profile", "export", "dev", "--format", "dbeaver"}); code != 0 {
+				t.Fatalf("DBeaver出力: %s", errs)
+			}
+			rows, err := csv.NewReader(strings.NewReader(out.String())).ReadAll()
+			if err != nil || len(rows) != 2 {
+				t.Fatalf("CSVとして解釈できない: %s %v", out, err)
+			}
+			expected := []string{"csql / alpha / dev", "127.0.0.1", "55431", "業務/db", "reader@team"}
+			if strings.Join(rows[0], ",") != "name,host,port,database,user" || strings.Join(rows[1], "|") != strings.Join(expected, "|") {
+				t.Fatalf("CSV項目が変化: %+v", rows)
+			}
+			out.Reset()
+			if code := a.Run(context.Background(), []string{"profile", "export", "dev", "--format", "a5"}); code != 0 {
+				t.Fatalf("A5出力: %s", errs)
+			}
+			text := out.String()
+			if !strings.HasPrefix(text, "\ufeffcsql/alpha/dev=__ConnectionType=Internal;") || !strings.Contains(text, "ProviderName="+db.provider+";") || !strings.Contains(text, "ServerName=127.0.0.1;Port=55431;Database=業務/db;UserName=reader@team;") || !strings.HasSuffix(text, "\r\n") || strings.Contains(text, "Password=") {
+				t.Fatalf("A5接続一覧が不正: %q", text)
+			}
+			// CLIのファイル出力でも同じバイトを保持し、既存ファイルを上書きしない。
+			dir, err := filepath.EvalSymlinks(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			file := filepath.Join(dir, "servers.a5dblist")
+			out.Reset()
+			if code := a.Run(context.Background(), []string{"profile", "export", "dev", "--format", "a5", "--output", file}); code != 0 {
+				t.Fatal(errs)
+			}
+			data, err := os.ReadFile(file)
+			if err != nil || string(data) != text {
+				t.Fatalf("ファイルと標準出力が不一致: %v", err)
+			}
+			if code := a.Run(context.Background(), []string{"profile", "export", "dev", "--format", "a5", "--output", file}); code == 0 {
+				t.Fatal("A5の既存出力を上書き")
+			}
+			// CSVのカンマ・引用符はレコードの区切りや列になってはならない。
+			p.Name, p.Database, p.Username = "quoted", "業務,\"db", "user,\"team"
+			if err := a.AddProfile(context.Background(), p); err != nil {
+				t.Fatal(err)
+			}
+			out.Reset()
+			if code := a.Run(context.Background(), []string{"profile", "export", "quoted", "--format", "dbeaver"}); code != 0 {
+				t.Fatal(errs)
+			}
+			rows, err = csv.NewReader(strings.NewReader(out.String())).ReadAll()
+			if err != nil || rows[1][3] != p.Database || rows[1][4] != p.Username {
+				t.Fatal("CSVの特殊文字を破損: ", out)
+			}
+		})
+	}
+}
+
+// 未解釈の区切り文字がA5の接続プロパティを増やしたり、別の接続へ書き換えたりしない。
+func TestProfileA5RejectsAmbiguousValues(t *testing.T) {
+	a, out, errs := testApp(t)
+	for i, value := range []string{"db;ServerName=other", "user\"quoted"} {
+		p := Profile{Name: fmt.Sprintf("bad%d", i), Instance: testInstance(), Database: value, Username: "reader", Port: 55431}
+		if err := a.AddProfile(context.Background(), p); err != nil {
+			t.Fatal(err)
+		}
+		out.Reset()
+		errs.Reset()
+		if code := a.Run(context.Background(), []string{"profile", "export", p.Name, "--format", "a5"}); code == 0 || out.Len() != 0 || !strings.Contains(errs.String(), "A5") {
+			t.Fatal("曖昧な接続値をA5へ出力: ", out, errs)
+		}
 	}
 }
