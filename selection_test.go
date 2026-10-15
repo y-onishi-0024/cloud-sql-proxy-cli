@@ -349,10 +349,14 @@ func TestConnectUIPgAdminDefaultExport(t *testing.T) {
 		t.Fatal("取消でも出力")
 	}
 	// 別設定もパスを入力せず出力でき、最初のファイルを保持する。
+	m.Update(tea.KeyMsg{Type: tea.KeyEsc})
 	m.selectedConnection().profile.Name, m.selectedConnection().profile.Database = "prod", "production"
 	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("e")})
 	m.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	third := m.fields[0].value
+	if !strings.Contains(filepath.Base(third), "csql-prod-") {
+		t.Fatal("別設定の保存先に切り替わらない")
+	}
 	_, cmd = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	if cmd == nil {
 		t.Fatal("別設定の出力を開始しない")
