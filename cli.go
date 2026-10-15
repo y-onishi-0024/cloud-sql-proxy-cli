@@ -80,7 +80,7 @@ func NewApp() *App {
 	return &App{Paths: Paths{filepath.Join(c, "csql"), filepath.Join(cache, "csql"), filepath.Join(c, "csql", "tools")}, In: os.Stdin, Out: os.Stdout, Err: os.Stderr, TTY: term.IsTerminal(os.Stdin.Fd()) && term.IsTerminal(os.Stdout.Fd()), OS: runtime.GOOS, Arch: runtime.GOARCH, Runner: osRunner{}, LookPath: exec.LookPath, Env: os.Getenv, Now: time.Now, QueryTimeout: 60 * time.Second, CheckTimeout: 10 * time.Second, StopGrace: 10 * time.Second, StartupTimeout: 60 * time.Second}
 }
 
-const version = "0.2.3"
+const version = "0.3.0"
 
 var ErrCancelled = errors.New("操作を取り消しました")
 

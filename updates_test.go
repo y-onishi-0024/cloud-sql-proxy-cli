@@ -23,7 +23,7 @@ func updateModel(t *testing.T, a *App) *connectUI {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	return &connectUI{a: a, ctx: ctx, cancelAll: cancel, state: "list", profileTab: true, profiles: []Profile{{Name: "dev", Instance: testInstance(), Database: "app", Username: "reader", Port: 55439}}, selector: selector{width: 60, height: 16}}
+	return &connectUI{a: a, ctx: ctx, cancelAll: cancel, state: "list", tab: tabProfiles, profiles: []Profile{{Name: "dev", Instance: testInstance(), Database: "app", Username: "reader", Port: 55439}}, selector: selector{width: 60, height: 16}}
 }
 
 // 実際のInitコマンドを配送する。静的な保存済み一覧なので接続workerは起動しない。
@@ -52,7 +52,7 @@ func TestStartupUpdateNoticeCache(t *testing.T) {
 	a.Now = func() time.Time { return now }
 	calls := 0
 	status := 200
-	body := `{"tag_name":"v0.2.10","html_url":"https://untrusted.invalid/"}`
+	body := `{"tag_name":"v0.10.0","html_url":"https://untrusted.invalid/"}`
 	a.HTTP = &http.Client{Transport: updateTransport(func(r *http.Request) (*http.Response, error) {
 		calls++
 		if r.Method != "GET" || r.URL.String() != "https://api.github.com/repos/y-onishi-0024/cloud-sql-proxy-cli/releases/latest" || r.Header.Get("Authorization") != "" {
@@ -64,7 +64,7 @@ func TestStartupUpdateNoticeCache(t *testing.T) {
 		m := updateModel(t, a)
 		deliverStartup(m)
 		view := m.View()
-		if !strings.Contains(view, "v0.2.10") || !strings.Contains(view, "github.com/y-onishi-0024/cloud-sql-proxy-cli/releases/latest") || strings.Contains(view, "untrusted.invalid") {
+		if !strings.Contains(view, "v0.10.0") || !strings.Contains(view, "github.com/y-onishi-0024/cloud-sql-proxy-cli/releases/latest") || strings.Contains(view, "untrusted.invalid") {
 			t.Fatal("新版と固定の更新先が案内されない: ", view)
 		}
 		now = now.Add(23 * time.Hour)
@@ -72,35 +72,35 @@ func TestStartupUpdateNoticeCache(t *testing.T) {
 	if calls != 1 {
 		t.Fatal("24時間以内に同じ確認を繰り返した")
 	}
-	body = `{"tag_name":"v0.3.0"}`
+	body = `{"tag_name":"v0.11.0"}`
 	m := updateModel(t, a)
 	deliverStartup(m)
-	if calls != 2 || !strings.Contains(m.View(), "v0.3.0") {
+	if calls != 2 || !strings.Contains(m.View(), "v0.11.0") {
 		t.Fatal("期限切れ後に最新版を確認しない")
 	}
 	// 時計が戻ったときに、未来の確認日時で永久に通信を抑止しない。
 	now = now.Add(-time.Hour)
-	body = `{"tag_name":"v0.4.0"}`
+	body = `{"tag_name":"v0.12.0"}`
 	m = updateModel(t, a)
 	deliverStartup(m)
-	if calls != 3 || !strings.Contains(m.View(), "v0.4.0") {
+	if calls != 3 || !strings.Contains(m.View(), "v0.12.0") {
 		t.Fatal("未来のキャッシュが再確認を抑止")
 	}
 	now = now.Add(25 * time.Hour)
 	status = 403
 	m = updateModel(t, a)
 	deliverStartup(m)
-	if !strings.Contains(m.View(), "v0.4.0") {
+	if !strings.Contains(m.View(), "v0.12.0") {
 		t.Fatal("通信失敗で前回確認済みの更新案内が消えた")
 	}
 	status = 200
-	body = `{"tag_name":"v0.5.0"}`
+	body = `{"tag_name":"v0.13.0"}`
 	if err := os.WriteFile(filepath.Join(a.Paths.CacheDir, "update-check.json"), []byte("{"), 0600); err != nil {
 		t.Fatal(err)
 	}
 	m = updateModel(t, a)
 	deliverStartup(m)
-	if !strings.Contains(m.View(), "v0.5.0") {
+	if !strings.Contains(m.View(), "v0.13.0") {
 		t.Fatal("壊れたキャッシュから回復しない")
 	}
 	// キャッシュ先が利用できなくても、取得した案内は通常通り表示する。
@@ -110,7 +110,7 @@ func TestStartupUpdateNoticeCache(t *testing.T) {
 	}
 	m = updateModel(t, a)
 	deliverStartup(m)
-	if !strings.Contains(m.View(), "v0.5.0") || m.resultErr != nil {
+	if !strings.Contains(m.View(), "v0.13.0") || m.resultErr != nil {
 		t.Fatal("キャッシュの書込失敗が通常操作へ影響")
 	}
 }
@@ -118,9 +118,9 @@ func TestStartupUpdateNoticeCache(t *testing.T) {
 // 正常JSONの後の追記や非正式な版を、24時間キャッシュとして採用しない。
 func TestStartupUpdateRefreshesCorruptCache(t *testing.T) {
 	for _, tc := range []struct{ name, tag, tail string }{
-		{"trailing-data", "v0.3.0", "broken"},
-		{"second-json", "v0.3.0", `{}`},
-		{"missing-prefix", "0.3.0", ""},
+		{"trailing-data", "v0.11.0", "broken"},
+		{"second-json", "v0.11.0", `{}`},
+		{"missing-prefix", "0.11.0", ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			a, _, _ := testApp(t)
@@ -136,11 +136,11 @@ func TestStartupUpdateRefreshesCorruptCache(t *testing.T) {
 			calls := 0
 			a.HTTP = &http.Client{Transport: updateTransport(func(*http.Request) (*http.Response, error) {
 				calls++
-				return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"tag_name":"v0.4.0"}`))}, nil
+				return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"tag_name":"v0.12.0"}`))}, nil
 			})}
 			m := updateModel(t, a)
 			deliverStartup(m)
-			if calls != 1 || !strings.Contains(m.View(), "v0.4.0") {
+			if calls != 1 || !strings.Contains(m.View(), "v0.12.0") {
 				t.Fatal("壊れたキャッシュが再確認を抑止")
 			}
 		})
@@ -153,16 +153,16 @@ func TestStartupUpdateIgnoresUnavailableRelease(t *testing.T) {
 		name, body string
 		status     int
 	}{
-		{"same", `{"tag_name":"v0.2.3"}`, 200},
+		{"same", `{"tag_name":"v0.3.0"}`, 200},
 		{"older", `{"tag_name":"v0.2.2"}`, 200},
-		{"prerelease", `{"tag_name":"v0.3.0","prerelease":true}`, 200},
-		{"draft", `{"tag_name":"v0.3.0","draft":true}`, 200},
-		{"suffix", `{"tag_name":"v0.3.0-rc.1"}`, 200},
-		{"control", `{"tag_name":"v0.3.0\u001b[31m"}`, 200},
+		{"prerelease", `{"tag_name":"v0.11.0","prerelease":true}`, 200},
+		{"draft", `{"tag_name":"v0.11.0","draft":true}`, 200},
+		{"suffix", `{"tag_name":"v0.11.0-rc.1"}`, 200},
+		{"control", `{"tag_name":"v0.11.0\u001b[31m"}`, 200},
 		{"overflow", `{"tag_name":"v9999999999999999999999.0.0"}`, 200},
 		{"invalid-json", `{"tag_name":`, 200},
-		{"oversized", `{"tag_name":"v0.3.0","body":"` + strings.Repeat("x", 256<<10) + `"}`, 200},
-		{"rate-limited", `{"tag_name":"v0.3.0"}`, 403},
+		{"oversized", `{"tag_name":"v0.11.0","body":"` + strings.Repeat("x", 256<<10) + `"}`, 200},
+		{"rate-limited", `{"tag_name":"v0.11.0"}`, 403},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			a, _, errs := testApp(t)
@@ -185,7 +185,7 @@ func TestStartupUpdateScopeAndOptOut(t *testing.T) {
 		t.Run(mode, func(t *testing.T) {
 			a, _, _ := testApp(t)
 			a.TTY = mode != "non-tty"
-			if err := writeJSON(filepath.Join(a.Paths.CacheDir, "update-check.json"), map[string]any{"checked_at": a.Now(), "latest": "v0.3.0"}); err != nil {
+			if err := writeJSON(filepath.Join(a.Paths.CacheDir, "update-check.json"), map[string]any{"checked_at": a.Now(), "latest": "v0.11.0"}); err != nil {
 				t.Fatal(err)
 			}
 			if mode == "disabled" {
@@ -278,7 +278,7 @@ func TestStartupUpdateNoticeLayouts(t *testing.T) {
 	a, _, _ := testApp(t)
 	a.TTY = true
 	a.HTTP = &http.Client{Transport: updateTransport(func(*http.Request) (*http.Response, error) {
-		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"tag_name":"v0.3.0"}`))}, nil
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"tag_name":"v0.11.0"}`))}, nil
 	})}
 	m := updateModel(t, a)
 	deliverStartup(m)
@@ -288,7 +288,7 @@ func TestStartupUpdateNoticeLayouts(t *testing.T) {
 			m.state = state
 			m.fields = []formField{{label: "設定名", value: "dev"}}
 			view := ansi.Strip(m.View())
-			if !strings.Contains(view, "v0.3.0") || !strings.Contains(view, "github.com/y-onishi-0024/cloud-sql-proxy-cli/releases/latest") || !strings.Contains(view, "Ctrl+C") {
+			if !strings.Contains(view, "v0.11.0") || !strings.Contains(view, "github.com/y-onishi-0024/cloud-sql-proxy-cli/releases/latest") || !strings.Contains(view, "Ctrl+C") {
 				t.Fatalf("%dx%d %sで更新先または終了案内が消える: %s", size[0], size[1], state, view)
 			}
 			lines := strings.Split(view, "\n")

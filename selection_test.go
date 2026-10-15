@@ -226,7 +226,7 @@ func TestConnectUIDelayedActions(t *testing.T) {
 				t.Fatal(err)
 			}
 			p.Name = "new-profile"
-			m := &connectUI{a: a, ctx: context.Background(), state: "connecting", generation: 1, running: true, workerKind: "connect", current: p, cancel: func() {}}
+			m := &connectUI{a: a, ctx: context.Background(), state: "connecting", generation: 1, selectedID: 1, connections: []*uiConnection{{id: 1, attempt: 1, profile: p, progress: &connectionProgress{snapshot: connectionSnapshot{Session: SessionStatus{Port: p.Port}}}, running: true, cancel: func() {}}}}
 			var pending tea.Cmd
 			if kind == "save" {
 				m.openForm(p)
@@ -236,7 +236,7 @@ func TestConnectUIDelayedActions(t *testing.T) {
 				m.fields[0].value = filepath.Join(a.Paths.ConfigDir, "export-uri.txt")
 				_, pending = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
 			}
-			m.Update(uiResult{generation: 1, kind: "connect", err: fmt.Errorf("Proxyが異常終了しました")})
+			m.Update(connectionFinished{id: 1, attempt: 1, err: fmt.Errorf("Proxyが異常終了しました")})
 			if m.state != "saving" {
 				t.Fatalf("Proxy終了で未完了%sの画面を解除: %s", kind, m.state)
 			}
@@ -246,10 +246,10 @@ func TestConnectUIDelayedActions(t *testing.T) {
 				t.Fatal("保存/出力中に画面移動・再試行")
 			}
 			_, cmd := m.Update(pending())
-			if m.running || cmd != nil {
+			if m.hasOwnedWork() || cmd != nil {
 				t.Fatal("遅い完了結果からProxyを再起動")
 			}
-			if kind == "save" && (m.saved.Name != p.Name || m.state != "error") {
+			if kind == "save" && (m.saved.Name != p.Name || m.selectedConnection().err == nil) {
 				t.Fatalf("保存結果/接続失敗を喪失: %+v", m.saved)
 			}
 			if kind == "export" && !strings.Contains(m.message, "ファイルへ出力しました") {
@@ -264,8 +264,8 @@ func TestConnectUIActivePortAndNarrowEscape(t *testing.T) {
 	progress := &connectionProgress{}
 	progress.reset(FailureContext{})
 	progress.snapshot.Session.Port = 55438
-	m := &connectUI{a: a, ctx: context.Background(), state: "connecting", running: true, workerKind: "connect", progress: progress, current: Profile{Instance: testInstance()}}
-	m.openForm(m.current)
+	m := &connectUI{a: a, ctx: context.Background(), state: "connecting", selectedID: 1, connections: []*uiConnection{{id: 1, attempt: 1, running: true, progress: progress, profile: Profile{Instance: testInstance()}}}}
+	m.openForm(m.selectedConnection().effectiveProfile())
 	m.fields[0].value, m.fields[1].value, m.fields[2].value, m.fields[3].value = "dev", "app", "reader", "55439"
 	if cmd := m.saveForm(); cmd != nil || m.state != "form" || !strings.Contains(m.message, "停止") {
 		t.Fatal("稼働中とは異なるPortを保存できる")
@@ -291,7 +291,7 @@ func TestConnectUIPgAdminDefaultExport(t *testing.T) {
 		t.Fatal(err)
 	}
 	p := Profile{Name: "dev", Instance: testInstance(), Database: "業務/db", Username: "reader", Port: 55439}
-	m := &connectUI{a: a, ctx: context.Background(), state: "stopped", current: p}
+	m := &connectUI{a: a, ctx: context.Background(), state: "connecting", selectedID: 1, connections: []*uiConnection{{id: 1, attempt: 1, profile: p}}}
 	_, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("e")})
 	if m.fields[0].value == "" {
 		t.Fatal("出力パスが空でEnterだけでは保存できない")
@@ -346,7 +346,7 @@ func TestConnectUIPgAdminDefaultExport(t *testing.T) {
 		t.Fatal("取消でも出力")
 	}
 	// 別設定もパスを入力せず出力でき、最初のファイルを保持する。
-	m.current.Name, m.current.Database = "prod", "production"
+	m.selectedConnection().profile.Name, m.selectedConnection().profile.Database = "prod", "production"
 	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("e")})
 	third := m.fields[0].value
 	_, cmd = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
@@ -438,7 +438,7 @@ func TestRichListLayout(t *testing.T) {
 func TestRichStateLayout(t *testing.T) {
 	a, _, _ := testApp(t)
 	p := Profile{Name: "dev", Instance: testInstance(), Database: "app", Username: "reader", Port: 55439}
-	m := &connectUI{a: a, ctx: context.Background(), selector: selector{width: 120, height: 28}, state: "list", profiles: []Profile{p}, profileTab: true, current: p}
+	m := &connectUI{a: a, ctx: context.Background(), selector: selector{width: 120, height: 28}, state: "list", profiles: []Profile{p}, tab: tabProfiles}
 	if view := m.View(); !strings.Contains(view, "reader") || !strings.Contains(view, "55439") {
 		t.Fatal("設定の詳細がない")
 	}
@@ -456,19 +456,19 @@ func TestRichStateLayout(t *testing.T) {
 	if view := m.View(); !strings.Contains(view, "application-default") || !strings.Contains(view, "login") || !strings.Contains(view, "ADC") {
 		t.Fatal("装飾で原因・次の操作が隠れる")
 	}
-	m.state, m.running, m.generation = "searching", true, 2
+	m.state, m.searching, m.tickEpoch, m.tickPending = "searching", true, 2, true
 	m.diagnostic = nil
 	before := m.View()
-	_, cmd := m.Update(uiTick{generation: 1})
+	_, cmd := m.Update(uiTick{epoch: 1})
 	if cmd != nil || m.View() != before {
 		t.Fatal("古い試行のアニメーションが継続")
 	}
-	_, cmd = m.Update(uiTick{generation: 2})
+	_, cmd = m.Update(uiTick{epoch: 2})
 	if cmd == nil || m.View() == before {
 		t.Fatal("検索中の表示が更新されない")
 	}
-	m.running = false
-	_, cmd = m.Update(uiTick{generation: 2})
+	m.searching = false
+	_, cmd = m.Update(uiTick{epoch: 3})
 	if cmd != nil {
 		t.Fatal("処理終了後もアニメーションが継続")
 	}
@@ -477,7 +477,7 @@ func TestRichStateLayout(t *testing.T) {
 func TestRichCompactProfileAndGuides(t *testing.T) {
 	a, _, _ := testApp(t)
 	p := Profile{Name: "dev", Instance: testInstance(), Database: "業務DB", Username: "reader-visible", Port: 55439}
-	m := &connectUI{a: a, ctx: context.Background(), state: "list", profileTab: true, profiles: []Profile{p}, current: p, selector: selector{width: 60, height: 16}}
+	m := &connectUI{a: a, ctx: context.Background(), state: "list", tab: tabProfiles, profiles: []Profile{p}, selector: selector{width: 60, height: 16}}
 	for _, value := range []string{"dev", "reader-visible", "業務DB", "127.0.0.1:55439", p.Project, p.Instance.Name} {
 		if !strings.Contains(m.View(), value) {
 			t.Fatalf("狭い設定一覧から欠落: %s", value)
@@ -524,7 +524,7 @@ func TestRichLongRecoveryGuide(t *testing.T) {
 
 // 接続中の保存結果も診断と同じページに含め、行数の境界で消さない。
 func TestRichRecoveryKeepsSaveResult(t *testing.T) {
-	m := &connectUI{state: "connecting", selector: selector{width: 60, height: 16}, message: "保存しました: dev"}
+	m := &connectUI{state: "error", selector: selector{width: 60, height: 16}, message: "保存しました: dev"}
 	m.diagnostic = &Diagnostic{Cause: "ADCの再認証が必要", Next: strings.Repeat("auth action\n", 15) + "final action"}
 	seen := map[string]bool{"保存しました: dev": false, "auth action": false, "final action": false}
 	for i := 0; i < 8; i++ {
