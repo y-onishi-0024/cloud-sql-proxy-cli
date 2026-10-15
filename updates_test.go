@@ -153,7 +153,7 @@ func TestStartupUpdateIgnoresUnavailableRelease(t *testing.T) {
 		name, body string
 		status     int
 	}{
-		{"same", `{"tag_name":"v0.3.0"}`, 200},
+		{"same", `{"tag_name":"v0.4.0"}`, 200},
 		{"older", `{"tag_name":"v0.2.2"}`, 200},
 		{"prerelease", `{"tag_name":"v0.11.0","prerelease":true}`, 200},
 		{"draft", `{"tag_name":"v0.11.0","draft":true}`, 200},
