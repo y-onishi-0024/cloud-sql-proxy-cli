@@ -88,7 +88,7 @@ func (s selector) View() string {
 	for _, r := range s.filtered() {
 		rows = append(rows, instanceChoice(r))
 	}
-	v := terminalView{width, height, s.color}
+	v := terminalView{width: width, height: height, color: s.color}
 	return v.choices(choiceView{title: "インスタンス一覧", tabs: "名前・プロジェクトで検索", query: s.query, pos: s.inputPos, cursor: s.cursor, rows: rows, footer: []string{"↑↓ 選択  Enter 接続  Ctrl+U 検索を消去", "Esc 取消  Ctrl+C 終了"}})
 }
 func instanceChoice(r Instance) terminalChoice {
@@ -237,6 +237,7 @@ type connectUI struct {
 	profileTab               bool
 	state                    string
 	frame                    int
+	updateVersion            string
 	recoveryPage             int
 	generation               int
 	running                  bool
@@ -283,18 +284,25 @@ func (m *connectUI) tick() tea.Cmd {
 	return tea.Tick(100*time.Millisecond, func(time.Time) tea.Msg { return uiTick{generation: generation} })
 }
 func (m *connectUI) Init() tea.Cmd {
+	var start tea.Cmd
 	if m.request.ProfileName != "" {
 		p, err := findProfile(m.profiles, m.request.ProfileName)
 		if err != nil {
 			m.fail(err, "local")
-			return nil
+		} else {
+			start = m.startConnect(p)
 		}
-		return m.startConnect(p)
+	} else if !m.profileTab {
+		start = m.search()
 	}
-	if m.profileTab {
-		return nil
+	if m.addOnly || !m.a.TTY || m.a.Env("CSQL_NO_UPDATE_CHECK") == "1" {
+		return start
 	}
-	return m.search()
+	// 接続generationから独立したCmdとし、検索変更や再試行で通知を失わない。
+	a, ctx := m.a, m.ctx
+	return tea.Batch(start, m.work(ctx, -1, "update", func() tea.Msg {
+		return updateChecked{latest: a.checkForUpdate(ctx)}
+	}))
 }
 func (m *connectUI) search() tea.Cmd {
 	if m.running {
@@ -510,6 +518,11 @@ func (m *connectUI) beginExport(format string) {
 }
 func (m *connectUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch v := msg.(type) {
+	case updateChecked:
+		if !m.exit {
+			m.updateVersion = v.latest
+		}
+		return m, nil
 	case tea.WindowSizeMsg:
 		m.selector.width = v.Width
 		m.selector.height = v.Height
@@ -851,7 +864,7 @@ func (m *connectUI) View() string {
 	if width < 60 || height < 16 {
 		return fitScreen("60列×16行以上に広げてください。\nCtrl+C: 所有Proxyを停止して終了", width, height)
 	}
-	v := terminalView{width, height, m.selector.color}
+	v := terminalView{width: width, height: height, color: m.selector.color, update: m.updateVersion}
 	tabs := "Cloud SQL 接続ワークスペース"
 	footer := []string{"↑↓ 選択  Enter 接続  Tab 切替  Ctrl+S 保存", "Ctrl+U 消去  Ctrl+L 注意  Esc 取消  Ctrl+C 終了"}
 	if m.state == "list" {

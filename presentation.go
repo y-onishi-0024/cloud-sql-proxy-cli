@@ -12,6 +12,7 @@ import (
 type terminalView struct {
 	width, height int
 	color         bool
+	update        string
 }
 type terminalChoice struct {
 	name, hint, summary string
@@ -55,6 +56,14 @@ func (v terminalView) panel(title string, lines []string, width, height int) str
 // 操作ガイドの2行を先に確保し、長い本文やログで隠さない。
 func (v terminalView) frame(title, subtitle, badge, body string, footer []string) string {
 	heading := paint(" csql ", tuiAccent, v.color) + " " + title
+	if v.update != "" {
+		// 既存のヘッダーだけを使い、最小画面でも本文と操作ガイドの高さを保つ。
+		heading = paint(" csql ", tuiAccent, v.color) + " 更新あり " + v.update
+		subtitle = updatePage
+		if ansi.StringWidth(subtitle) > v.width {
+			subtitle = strings.TrimPrefix(subtitle, "https://")
+		}
+	}
 	room := v.width - ansi.StringWidth(badge) - 1
 	lines := []string{paddedLine(heading, max(0, room)) + " " + badge, ansi.Truncate(subtitle, v.width, "…")}
 	content := strings.Split(body, "\n")

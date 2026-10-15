@@ -19,14 +19,24 @@ CLIの利用にGoは不要です。初回はOS別のセットアップアプリ�
 
 | OS | 配布物 |
 | --- | --- |
-| macOS Apple Silicon | [v0.2.2をダウンロード](https://github.com/y-onishi-0024/cloud-sql-proxy-cli/releases/download/v0.2.2/csql-setup-0.2.2-macos-arm64.zip)。展開して `.app` を開く |
-| macOS Intel | [v0.2.2をダウンロード](https://github.com/y-onishi-0024/cloud-sql-proxy-cli/releases/download/v0.2.2/csql-setup-0.2.2-macos-amd64.zip)。展開して `.app` を開く |
-| Windows amd64 | [v0.2.2をダウンロード](https://github.com/y-onishi-0024/cloud-sql-proxy-cli/releases/download/v0.2.2/csql-setup-0.2.2-windows-amd64.zip)。展開して `.exe` を開く |
+| macOS Apple Silicon | Releasesの `csql-setup-<版>-macos-arm64.zip` を展開して `.app` を開く |
+| macOS Intel | Releasesの `csql-setup-<版>-macos-amd64.zip` を展開して `.app` を開く |
+| Windows amd64 | Releasesの `csql-setup-<版>-windows-amd64.zip` を展開して `.exe` を開く |
+
+`<版>` は選択したリリースの版番号です。公開中の版はReleasesで確認してください。ローカルで作成した配布用ZIPは `dist/releases/v<版>/` に置きます。
 
 画面の「セットアップ開始」から、導入対象・保存先を確認して実行します。不足ツールの導入とPATH変更は、それぞれ別に承認します。macOSは実際に使うシェルを選んでください。実行中の取消も可能で、取消処理が終わるまで画面を保持します。失敗/取消時は詳細を確認して再試行できます。
 
 通常CLIをセットアップアプリに同梱しており、セットアップアプリ自体をcsqlとして配置しません。Googleのログインは完了後に表示されたコマンドから行います。セットアップ後はターミナルを開き直してください。
 macOSのアプリは12.0以降が対象です。ローカル生成物はアドホック署名済みで、公開用Developer ID署名・公証は未実施です。Windowsも公開用の証明書署名は未実施です。
+
+### 起動時の更新通知（v0.2.3以降）
+
+`csql` / `csql connect` の対話起動時に、GitHub Releasesの最新版をバックグラウンドで確認します。新しい正式版があれば、画面上部に版番号とダウンロード先を表示します。ダウンロードしたセットアップを実行して更新してください。自動インストールは行いません。
+
+確認は最大2秒で、検索・接続操作を待たせません。成功した確認結果を24時間キャッシュし、オフラインやAPI制限時は通常操作を続けます。以前確認した新版がある場合はその案内を保持します。確認先はこの公開リポジトリのGitHub APIだけで、認証情報・接続先・利用者情報は送信しません。
+
+非対話実行、`version` / `--help` などの補助コマンド、`profile add` では更新確認しません。`CSQL_NO_UPDATE_CHECK=1` を環境変数へ設定すると、通信と通知の両方を無効にできます。確認結果はOSのキャッシュ領域の `csql/update-check.json` に保存し、このファイルを削除すると次回の対話起動で再確認します。
 
 ターミナルから設定する場合は、従来のCLIも利用できます。
 
