@@ -220,7 +220,7 @@ func (a *App) PrepareProfile(p Profile) (Profile, error) {
 		}
 	}
 	requested := p.Port
-	p.Port, err = availableProfilePort(p.Instance, p.Port, rows)
+	p.Port, err = availableProfilePort(p.Instance, p.Port, rows, a.reservedProxyPorts())
 	if err != nil {
 		// 接続中の「保存」では、署名で確認した自分のセッションのPortだけ再利用する。
 		if requested > 0 {
@@ -240,8 +240,11 @@ func (a *App) PrepareProfile(p Profile) (Profile, error) {
 	}
 	return p, validateProfile(p)
 }
-func availableProfilePort(v Instance, explicit int, rows []Profile) (int, error) {
+func availableProfilePort(v Instance, explicit int, rows []Profile, unavailable map[int]bool) (int, error) {
 	if explicit != 0 {
+		if unavailable[explicit] {
+			return 0, fmt.Errorf("Port %d は起動中・稼働中の接続が予約しています。csql status を確認してください", explicit)
+		}
 		for _, p := range rows {
 			if p.Port == explicit && p.ConnectionName != v.ConnectionName {
 				return 0, fmt.Errorf("Port %d は %s の保存済み予約です", explicit, p.ConnectionName)
@@ -261,7 +264,7 @@ func availableProfilePort(v Instance, explicit int, rows []Profile) (int, error)
 		return 0, fmt.Errorf("未知のDB種別です。--port を指定してください")
 	}
 	for n := base; n < base+21; n++ {
-		reserved := false
+		reserved := unavailable[n]
 		for _, p := range rows {
 			if p.Port == n {
 				reserved = true
@@ -276,7 +279,7 @@ func availableProfilePort(v Instance, explicit int, rows []Profile) (int, error)
 	}
 	return 0, fmt.Errorf("空きPortがありません。csql status と保存済み予約を確認し、--port を指定してください")
 }
-func (a *App) profilePort(v Instance, explicit int) (int, error) {
+func (a *App) profilePort(v Instance, explicit int, unavailable map[int]bool) (int, error) {
 	rows, err := a.LoadProfiles()
 	if err != nil {
 		return 0, err
@@ -286,6 +289,9 @@ func (a *App) profilePort(v Instance, explicit int) (int, error) {
 			if explicit != 0 && explicit != p.Port {
 				return 0, fmt.Errorf("指定Port %d は登録済みPort %d と一致しません。DBツールの設定を維持するため変更しません", explicit, p.Port)
 			}
+			if unavailable[p.Port] {
+				return 0, fmt.Errorf("保存済みPort %d は起動中・稼働中です。csql status を確認してください。別Portへ自動変更しません", p.Port)
+			}
 			port, err := choosePort(v.DatabaseVersion, p.Port)
 			if err != nil {
 				return 0, fmt.Errorf("保存済みPort %d は使用中です。csql status で既存セッションを確認してください。別Portへ自動変更しません", p.Port)
@@ -293,7 +299,7 @@ func (a *App) profilePort(v Instance, explicit int) (int, error) {
 			return port, nil
 		}
 	}
-	return availableProfilePort(v, explicit, rows)
+	return availableProfilePort(v, explicit, rows, unavailable)
 }
 
 func profileExport(p Profile, format string) ([]byte, error) {

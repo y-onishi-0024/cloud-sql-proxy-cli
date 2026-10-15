@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -62,7 +63,15 @@ func TestMain(m *testing.M) {
 				mode = "auth-fail"
 			}
 		}
-		if os.Getenv("CSQL_TEST_UI_DIR") != "" {
+		if gate := os.Getenv("CSQL_TEST_BIND_GATE"); gate != "" {
+			for {
+				if _, err := os.Stat(gate); err == nil {
+					break
+				}
+				time.Sleep(2 * time.Millisecond)
+			}
+		}
+		if os.Getenv("CSQL_TEST_UI_DIR") != "" || os.Getenv("CSQL_TEST_BIND") == "1" {
 			for i, arg := range os.Args {
 				if arg == "--port" && i+1 < len(os.Args) {
 					l, err := net.Listen("tcp", "127.0.0.1:"+os.Args[i+1])
@@ -71,6 +80,15 @@ func TestMain(m *testing.M) {
 						os.Exit(7)
 					}
 					defer l.Close()
+					go func() {
+						for {
+							c, err := l.Accept()
+							if err != nil {
+								return
+							}
+							c.Close()
+						}
+					}()
 					break
 				}
 			}
@@ -292,6 +310,124 @@ func awaitSession(t *testing.T, a *App) SessionStatus {
 	}
 	t.Fatal("セッション公開の時間切れ")
 	return SessionStatus{}
+}
+
+func awaitSessions(t *testing.T, a *App, count int) []SessionStatus {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		rows, err := a.Status(context.Background())
+		if err == nil && len(rows) == count {
+			return rows
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("%d件のセッション公開を待機", count)
+	return nil
+}
+
+func awaitProxyPort(t *testing.T, port int) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 20*time.Millisecond)
+		if err == nil {
+			c.Close()
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("Port %dが待受しない", port)
+}
+
+// 子のbind前に別の接続を起動しても、同じポートを選ばない。
+func TestConcurrentConnectPortReservations(t *testing.T) {
+	a := proxyApp(t)
+	gate := filepath.Join(t.TempDir(), "bind")
+	t.Setenv("CSQL_TEST_BIND_GATE", gate)
+	t.Setenv("CSQL_TEST_BIND", "1")
+	ctx, cancel := context.WithCancel(context.Background())
+	var workers sync.WaitGroup
+	t.Cleanup(func() { cancel(); workers.Wait() })
+	start := func(v Instance) {
+		workers.Add(1)
+		go func() { defer workers.Done(); _ = a.Connect(ctx, v, ConnectOptions{Progress: &connectionProgress{}}) }()
+	}
+	start(testInstance())
+	awaitSessions(t, a, 1)
+	other := testInstance()
+	other.Name, other.ConnectionName = "second", "alpha:asia-northeast1:second"
+	start(other)
+	rows := awaitSessions(t, a, 2)
+	if rows[0].Port == rows[1].Port {
+		t.Fatal("bind前の並行起動で同じポートを割り当てた")
+	}
+	// OS上はまだ空いていても、明示・保存済みの予約を別Portへ変えない。
+	conflict := other
+	conflict.Name, conflict.ConnectionName = "conflict", "alpha:asia-northeast1:conflict"
+	if err := a.Connect(ctx, conflict, ConnectOptions{Port: rows[0].Port, Progress: &connectionProgress{}}); err == nil {
+		t.Fatal("起動待ちの明示Portを重複利用")
+	}
+	row := rows[0]
+	reserved := Profile{Name: "pending", Instance: Instance{row.Project, row.Name, row.Region, row.Project + ":" + row.Region + ":" + row.Name, row.DatabaseVersion}, Database: "app", Username: "reader", Port: row.Port}
+	if err := a.AddProfile(ctx, reserved); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Connect(ctx, reserved.Instance, ConnectOptions{Progress: &connectionProgress{}}); err == nil || !strings.Contains(err.Error(), "別Portへ自動変更しません") {
+		t.Fatal("起動待ちの保存済みPortを変更: ", err)
+	}
+	if err := os.WriteFile(gate, []byte("release"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range rows {
+		awaitProxyPort(t, row.Port)
+	}
+	if err := a.Stop(context.Background(), rows[0].ID, false); err != nil {
+		t.Fatal(err)
+	}
+	awaitSessions(t, a, 1)
+	awaitProxyPort(t, rows[1].Port)
+}
+
+// 起動失敗でポートを予約したままにせず、次の起動で再利用できる。
+func TestConcurrentConnectReservationRelease(t *testing.T) {
+	a := proxyApp(t)
+	argsFile := filepath.Join(t.TempDir(), "args.json")
+	t.Setenv("CSQL_TEST_ARGSFILE", argsFile)
+	t.Setenv("CSQL_TEST_EXIT", "1")
+	if err := a.Connect(context.Background(), testInstance(), ConnectOptions{Progress: &connectionProgress{}}); err == nil {
+		t.Fatal("異常終了を成功と判断")
+	}
+	data, err := os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var args []string
+	if err := json.Unmarshal(data, &args); err != nil {
+		t.Fatal(err)
+	}
+	port := 0
+	for i := range args {
+		if args[i] == "--port" && i+1 < len(args) {
+			port, _ = strconv.Atoi(args[i+1])
+		}
+	}
+	if port == 0 {
+		t.Fatal("起動したポートを観測できない")
+	}
+	t.Setenv("CSQL_TEST_EXIT", "0")
+	t.Setenv("CSQL_TEST_BIND", "1")
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- a.Connect(ctx, testInstance(), ConnectOptions{Port: port, Progress: &connectionProgress{}})
+	}()
+	t.Cleanup(func() { cancel(); <-done })
+	row := awaitSession(t, a)
+	if row.Port != port {
+		t.Fatal("失敗したポートを再利用できない")
+	}
+	awaitProxyPort(t, port)
 }
 
 func TestSessionOwnedLifecycle(t *testing.T) {
