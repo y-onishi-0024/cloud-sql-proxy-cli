@@ -443,6 +443,10 @@ func (m *connectUI) openForm(p Profile) {
 	if m.state == "connecting" {
 		if c := m.selectedConnection(); c != nil {
 			p = c.effectiveProfile()
+			if c.stopping {
+				m.message = "停止処理の完了を待ってから保存してください"
+				return
+			}
 			if c.running && (c.progress == nil || c.progress.Snapshot().Session.Port == 0) {
 				m.message = "Portの確定を待ってから保存してください"
 				return
@@ -514,6 +518,14 @@ func (m *connectUI) beginExport(format string) {
 	p := m.editProfile
 	if c := m.selectedConnection(); c != nil && m.state == "connecting" {
 		p = c.effectiveProfile()
+		if c.stopping {
+			m.message = "停止処理の完了を待ってから出力してください"
+			return
+		}
+		if c.running && (c.progress == nil || c.progress.Snapshot().Session.Port == 0) {
+			m.message = "Portの確定を待ってから出力してください"
+			return
+		}
 	}
 	if p.Name == "" {
 		m.message = "先に接続設定を保存してください"

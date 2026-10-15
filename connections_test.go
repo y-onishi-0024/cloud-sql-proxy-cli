@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -235,6 +236,7 @@ func TestConnectionsSaveAndExportOwnership(t *testing.T) {
 				t.Fatal("別処理で保存中の画面を変更")
 			}
 			h.until("保存しました: first")
+			h.pumpUntil(func() bool { return !ending.running }, "停止完了後に出力を再開")
 			p := h.m.saved
 			if p.Instance.ConnectionName != first.profile.ConnectionName || p.Database != "業務/db" || p.Username != "reader" || p.Port != actualPort {
 				t.Fatalf("保存対象が混線: %+v", p)
@@ -285,8 +287,14 @@ func TestConnectionsShutdownIsolation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan error, 1)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	externalPort := listener.Addr().(*net.TCPAddr).Port
+	listener.Close()
 	go func() {
-		done <- external.Connect(ctx, testInstance(), ConnectOptions{Port: 55458, Progress: &connectionProgress{}})
+		done <- external.Connect(ctx, testInstance(), ConnectOptions{Port: externalPort, Progress: &connectionProgress{}})
 	}()
 	ext := awaitSession(t, external)
 	awaitProxyPort(t, ext.Port)
@@ -374,4 +382,68 @@ func TestConnectionsNavigationDuringSearch(t *testing.T) {
 	if !strings.Contains(m.View(), "エラー") {
 		t.Fatal("非選択のエラーが一覧に表示されない")
 	}
+}
+
+// 再試行の終了待ち中に旧実ポートを保存・出力し、次の試行の設定と混線させない。
+func TestConnectionsEditingDuringRetry(t *testing.T) {
+	a, _, _ := testApp(t)
+	h := newConnectionsHarness(t, a)
+	p := Profile{Name: "dev", Instance: testInstance(), Database: "old-db", Username: "old-user", Port: 55439}
+	c := &uiConnection{id: 1, attempt: 1, profile: p, running: true, cancel: func() {}, progress: &connectionProgress{snapshot: connectionSnapshot{Session: SessionStatus{Port: p.Port}}}}
+	h.m.connections = []*uiConnection{c}
+	h.m.selectedID = 1
+	h.m.state = "connecting"
+	// 停止を開始した直後もCtrl+S/Eは旧試行の編集へ入らず、待機理由を案内する。
+	h.m.stopConnection(c.id, true)
+	for _, key := range []string{"ctrl+s", "e", "u"} {
+		h.key(key)
+		if h.m.state != "connecting" || !strings.Contains(h.m.message, "停止") {
+			t.Fatalf("停止待ちの%sで旧試行を編集: %s", key, h.m.state)
+		}
+	}
+	// 次の試行が始まっても、実ポート確定前は出力を作らない。
+	h.m.finishConnection(connectionFinished{id: 1, attempt: 1, err: context.Canceled})
+	for _, key := range []string{"ctrl+s", "e", "u"} {
+		h.key(key)
+		if h.m.state != "connecting" || !strings.Contains(h.m.message, "Port") {
+			t.Fatalf("起動待ちの%sで未確定Portを出力", key)
+		}
+	}
+}
+
+// 停止済みの同じ接続は詳細へ戻り、旧履歴からの再試行でも稼働中の同じDBを二重起動しない。
+func TestConnectionsReusesStoppedConnection(t *testing.T) {
+	a := proxyApp(t)
+	t.Setenv("CSQL_TEST_BIND", "1")
+	h := newConnectionsHarness(t, a)
+	h.key("enter")
+	h.until("Proxy利用可能")
+	first := h.m.selectedConnection()
+	h.key("s")
+	h.until("停止済み")
+	h.key("n")
+	h.key("enter")
+	if len(h.m.connections) != 1 || h.m.selectedID != first.id {
+		t.Fatal("停止済みの同じ接続を別IDで追加")
+	}
+	h.key("r")
+	h.until("Proxy利用可能")
+	if first.attempt != 2 {
+		t.Fatal("停止済みの再試行が同じIDを使わない")
+	}
+	h.key("s")
+	h.until("停止済み")
+	// 接続方式を変更して追加する経路は維持し、旧履歴のRから重複させない。
+	changed := first.profile
+	changed.PrivateIP = true
+	h.command(h.m.startConnection(changed))
+	h.until("Proxy利用可能")
+	active := h.m.selectedConnection()
+	h.m.selectedID = first.id
+	h.key("r")
+	if h.m.selectedID != active.id || first.running {
+		t.Fatal("古い停止済み接続のRから同じDBを二重起動")
+	}
+	rows := awaitSessions(t, a, 1)
+	awaitProxyPort(t, rows[0].Port)
 }

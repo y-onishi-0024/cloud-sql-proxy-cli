@@ -92,21 +92,19 @@ func (m *connectUI) startConnection(p Profile) tea.Cmd {
 	if len(m.connections) == 0 && m.request.Port != 0 {
 		p.Port = m.request.Port
 	}
+	// 稼働中を先に照合し、古い停止履歴より現在のProxyへ移動する。
 	for _, c := range m.connections {
-		if !c.running || c.profile.ConnectionName != p.ConnectionName {
-			continue
+		if c.running && c.profile.ConnectionName == p.ConnectionName {
+			m.focusConnection(c, p)
+			return nil
 		}
-		m.selectedID = c.id
-		m.state = "connecting"
-		m.message = ""
+	}
+	for _, c := range m.connections {
 		live := c.effectiveProfile()
-		if p.PrivateIP != live.PrivateIP || (p.Port != 0 && p.Port != live.Port) {
-			m.message = fmt.Sprintf("このインスタンスは既に %s / Port %d で接続処理中です。変更するにはSで停止後、追加してください", map[bool]string{true: "Private IP", false: "Public IP"}[live.PrivateIP], live.Port)
-		} else if p.Name != "" {
-			// 同じProxyでも、選んだ保存済み設定のDB・ユーザーを出力へ反映する。
-			c.profile = p
+		if !c.running && live.ConnectionName == p.ConnectionName && live.PrivateIP == p.PrivateIP && (p.Port == 0 || p.Port == live.Port) {
+			m.focusConnection(c, p)
+			return nil
 		}
-		return nil
 	}
 	m.nextID++
 	c := &uiConnection{id: m.nextID, profile: p}
@@ -117,7 +115,26 @@ func (m *connectUI) startConnection(p Profile) tea.Cmd {
 	m.diagnostic = nil
 	return m.launchConnection(c)
 }
+
+// 同じProxyの再利用では選択した保存済み設定のDB・ユーザーを保持する。
+func (m *connectUI) focusConnection(c *uiConnection, p Profile) {
+	m.selectedID = c.id
+	m.state = "connecting"
+	m.message = ""
+	live := c.effectiveProfile()
+	if p.PrivateIP != live.PrivateIP || (p.Port != 0 && p.Port != live.Port) {
+		m.message = fmt.Sprintf("このインスタンスは既に %s / Port %d で接続処理中です。変更するにはSで停止後、追加してください", map[bool]string{true: "Private IP", false: "Public IP"}[live.PrivateIP], live.Port)
+	} else if p.Name != "" {
+		c.profile = p
+	}
+}
 func (m *connectUI) launchConnection(c *uiConnection) tea.Cmd {
+	for _, other := range m.connections {
+		if other != c && other.running && other.profile.ConnectionName == c.profile.ConnectionName {
+			m.focusConnection(other, c.profile)
+			return nil
+		}
+	}
 	c.attempt++
 	c.progress = &connectionProgress{}
 	c.running, c.stopping, c.retry = true, false, false
