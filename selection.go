@@ -942,7 +942,13 @@ func (m *connectUI) View() string {
 			c.notice = fmt.Sprintf("! 検索注意 %d件", len(m.notices))
 		}
 		if m.tab == tabConnections {
-			c.title = "接続一覧"
+			active := 0
+			for _, conn := range m.connections {
+				if conn.running {
+					active++
+				}
+			}
+			c.title = fmt.Sprintf("接続一覧（稼働 %d件 / 全%d件）", active, len(m.connections))
 			c.footer = []string{"↑↓ 選択  Enter 詳細  Ctrl+D 個別停止  Tab 切替", "Ctrl+U 消去  Esc 戻る  Ctrl+C この画面の全接続停止"}
 			for _, conn := range m.matchedConnections() {
 				p := conn.effectiveProfile()
@@ -1028,6 +1034,9 @@ func (m *connectUI) View() string {
 		if c != nil && !c.running {
 			label = "○ 停止済み"
 			badge = paint("○ 停止済み", tuiMuted, v.color)
+			if c.err != nil {
+				badge = paint("! 接続エラー", tuiError, v.color)
+			}
 		}
 		if c != nil && c.stopping {
 			label = spin + " 停止中"

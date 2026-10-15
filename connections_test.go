@@ -124,6 +124,10 @@ func TestConnectionsAddSwitchAndStop(t *testing.T) {
 		awaitProxyPort(t, row.Port)
 	}
 	h.key("esc")
+	h.m.updateVersion = "v0.4.0"
+	if !strings.Contains(h.m.View(), "稼働 2件") {
+		t.Fatal("更新通知で稼働件数を喪失")
+	}
 	if !strings.Contains(h.m.View(), "接続一覧") {
 		t.Fatal("Escが接続を停止し、接続一覧へ戻らない")
 	}
