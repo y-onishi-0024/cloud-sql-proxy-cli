@@ -1,0 +1,19 @@
+.tools/
+.cache/
+dist/
+.superpowers/
+
+# 個人設定・認証情報・端末の生成物は公開対象に含めない。
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+application_default_credentials.json
+credentials.json
+profiles.json
+profiles.lock
+csql-*-pgadmin.json
+csql-*-pgadmin-[0-9]*.json
+sessions/
+.DS_Store

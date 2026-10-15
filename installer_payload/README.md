@@ -1,0 +1,4 @@
+# ビルド時の同梱物
+
+通常CLIとmanifest.jsonはscripts/build-installers.pyが独立したビルド領域で生成します。
+このディレクトリへ配布バイナリを追跡追加しません。installer tagだけで直接ビルドした場合は、実行時に同梱物不足として処理を止めます。
