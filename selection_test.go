@@ -293,6 +293,7 @@ func TestConnectUIPgAdminDefaultExport(t *testing.T) {
 	p := Profile{Name: "dev", Instance: testInstance(), Database: "業務/db", Username: "reader", Port: 55439}
 	m := &connectUI{a: a, ctx: context.Background(), state: "connecting", selectedID: 1, connections: []*uiConnection{{id: 1, attempt: 1, profile: p}}}
 	_, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("e")})
+	m.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	if m.fields[0].value == "" {
 		t.Fatal("出力パスが空でEnterだけでは保存できない")
 	}
@@ -333,7 +334,9 @@ func TestConnectUIPgAdminDefaultExport(t *testing.T) {
 		t.Fatal(err)
 	}
 	m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m.Update(tea.KeyMsg{Type: tea.KeyEsc})
 	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("e")})
+	m.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	second := m.fields[0].value
 	if second == first {
 		t.Fatal("既存ファイルと同じ出力先を提案")
@@ -348,6 +351,7 @@ func TestConnectUIPgAdminDefaultExport(t *testing.T) {
 	// 別設定もパスを入力せず出力でき、最初のファイルを保持する。
 	m.selectedConnection().profile.Name, m.selectedConnection().profile.Database = "prod", "production"
 	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("e")})
+	m.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	third := m.fields[0].value
 	_, cmd = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	if cmd == nil {
@@ -363,7 +367,9 @@ func TestConnectUIPgAdminDefaultExport(t *testing.T) {
 	}
 	// 出力画面を開いた後の競合も上書きせず失敗し、編集して保存し直せる。
 	m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m.Update(tea.KeyMsg{Type: tea.KeyEsc})
 	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("e")})
+	m.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	collision := m.fields[0].value
 	if err := os.WriteFile(collision, []byte("keep-existing"), 0600); err != nil {
 		t.Fatal(err)
@@ -539,6 +545,101 @@ func TestRichRecoveryKeepsSaveResult(t *testing.T) {
 	for text, visible := range seen {
 		if !visible {
 			t.Fatalf("診断ページの境界で表示が消える: %s", text)
+		}
+	}
+}
+
+// Eはツール選択へ進み、背景の接続終了でも対象を保って自動保存先へ進む。
+func TestConnectUIExportToolMenu(t *testing.T) {
+	for index, tc := range []struct{ format, ext, guide string }{{"pgadmin", ".json", "Import/Export Servers"}, {"dbeaver", ".csv", "Custom"}, {"a5", ".a5dblist", "データベースの追加と削除"}, {"uri", ".txt", "接続URI"}} {
+		t.Run(tc.format, func(t *testing.T) {
+			a, _, _ := testApp(t)
+			t.Chdir(filepath.Dir(a.Paths.ConfigDir))
+			p := Profile{Name: "dev", Instance: testInstance(), Database: "業務db", Username: "reader@team", Port: 55439}
+			m := &connectUI{a: a, ctx: context.Background(), state: "connecting", selectedID: 1, selector: selector{width: 60, height: 16}, connections: []*uiConnection{{id: 1, attempt: 1, profile: p, running: true, progress: &connectionProgress{snapshot: connectionSnapshot{Session: SessionStatus{Port: p.Port}}}}, {id: 2, attempt: 1, running: true, profile: Profile{Instance: testInstance()}}}}
+			m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("e")})
+			for _, label := range []string{"pgAdmin", "DBeaver", "A5:SQL Mk-2", "接続URI"} {
+				if !strings.Contains(m.View(), label) {
+					t.Fatalf("Eの選択肢に%sがない: %s", label, m.View())
+				}
+			}
+			m.Update(connectionFinished{id: 2, attempt: 1, err: fmt.Errorf("別の接続が終了")})
+			for i := 0; i < index; i++ {
+				m.Update(tea.KeyMsg{Type: tea.KeyDown})
+			}
+			m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+			if m.state != "export" || m.exportFormat != tc.format || len(m.fields) != 1 {
+				t.Fatal("ツール選択から出力へ進めない")
+			}
+			file := m.fields[0].value
+			if !filepath.IsAbs(file) || filepath.Ext(file) != tc.ext || !strings.Contains(filepath.Base(file), "csql-dev-") {
+				t.Fatalf("自動保存先が不正: %s", file)
+			}
+			if m.editOwner != 1 || m.editAttempt != 1 || m.editProfile.Database != "業務db" || m.editProfile.Port != 55439 {
+				t.Fatal("背景終了で出力対象が混線")
+			}
+			m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+			if !strings.Contains(m.View(), "DBeaver") || m.state == "connecting" {
+				t.Fatal("出力パスからツール選択へ戻れない")
+			}
+			if _, err := os.Stat(file); !os.IsNotExist(err) {
+				t.Fatal("取消時に出力")
+			}
+			m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+			// 保存Cmd配送前に出力対象が終了しても、完了結果とツール別案内を保持する。
+			_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+			m.Update(connectionFinished{id: 1, attempt: 1})
+			if cmd == nil {
+				t.Fatal("Enterだけで出力できない")
+			}
+			m.Update(cmd())
+			if !strings.Contains(m.message, tc.guide) || !strings.Contains(m.message, file) {
+				t.Fatalf("ツール別の取込案内がない: %s", m.message)
+			}
+			if _, err := os.Stat(file); err != nil {
+				t.Fatal(err)
+			}
+			m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+			m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+			if m.state != "connecting" {
+				t.Fatal("ツール選択の取消で接続詳細へ戻れない")
+			}
+			if view := m.View(); !strings.Contains(view, "E エクスポート") || strings.Contains(view, "U URI") {
+				t.Fatal("出力キーが統合されていない")
+			}
+		})
+	}
+}
+
+// 非対応の形式はツール選択画面で説明し、Proxyを止めずに別形式を選び直せる。
+func TestConnectUIExportUnsupportedTool(t *testing.T) {
+	for _, tc := range []struct {
+		version, database, fragment string
+		index                       int
+	}{{"SQLSERVER_2019_STANDARD", "app", "PostgreSQL", 0}, {"POSTGRES_18", "app;other", "セミコロン", 2}} {
+		a, _, _ := testApp(t)
+		t.Chdir(filepath.Dir(a.Paths.ConfigDir))
+		p := Profile{Name: "dev", Instance: testInstance(), Database: tc.database, Username: "reader", Port: 55439}
+		p.DatabaseVersion = tc.version
+		c := &uiConnection{id: 1, attempt: 1, profile: p, running: true, progress: &connectionProgress{snapshot: connectionSnapshot{Session: SessionStatus{Port: p.Port}}}}
+		m := &connectUI{a: a, ctx: context.Background(), state: "connecting", selectedID: 1, connections: []*uiConnection{c}, selector: selector{width: 60, height: 16}, updateVersion: "v0.4.0"}
+		m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("e")})
+		for i := 0; i < tc.index; i++ {
+			m.Update(tea.KeyMsg{Type: tea.KeyDown})
+		}
+		m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+		if m.state != "exportTools" || !strings.Contains(m.View(), tc.fragment) || !c.running {
+			t.Fatalf("非対応の理由/再選択が失われた: %s", m.View())
+		}
+		// DBeaverは両ケースで使用できる。選択し直しても接続は維持される。
+		direction := tea.KeyDown
+		if tc.index == 2 {
+			direction = tea.KeyUp
+		}
+		m.Update(tea.KeyMsg{Type: direction})
+		m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+		if m.state != "export" || m.exportFormat != "dbeaver" || !c.running {
+			t.Fatal("別の形式を選び直せない")
 		}
 	}
 }
