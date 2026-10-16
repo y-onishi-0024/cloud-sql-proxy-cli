@@ -426,7 +426,7 @@ func TestConnectionsAddSwitchAndStop(t *testing.T) {
 		awaitProxyPort(t, row.Port)
 	}
 	h.key("esc")
-	h.m.updateVersion = "v0.6.0"
+	h.m.updateVersion = "v0.8.0"
 	if !strings.Contains(h.m.View(), "稼働 2件") {
 		t.Fatal("更新通知で稼働件数を喪失")
 	}

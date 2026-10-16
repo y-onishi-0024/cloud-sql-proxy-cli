@@ -700,7 +700,7 @@ func TestConnectUIExportUnsupportedTool(t *testing.T) {
 		p := Profile{Name: "dev", Instance: testInstance(), Database: tc.database, Username: "reader", Port: 55439}
 		p.DatabaseVersion = tc.version
 		c := &uiConnection{id: 1, attempt: 1, profile: p, running: true, progress: &connectionProgress{snapshot: connectionSnapshot{Session: SessionStatus{Port: p.Port}}}}
-		m := &connectUI{a: a, ctx: context.Background(), state: "connecting", selectedID: 1, connections: []*uiConnection{c}, selector: selector{width: 60, height: 16}, updateVersion: "v0.6.0"}
+		m := &connectUI{a: a, ctx: context.Background(), state: "connecting", selectedID: 1, connections: []*uiConnection{c}, selector: selector{width: 60, height: 16}, updateVersion: "v0.8.0"}
 		m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("e")})
 		for i := 0; i < tc.index; i++ {
 			m.Update(tea.KeyMsg{Type: tea.KeyDown})
