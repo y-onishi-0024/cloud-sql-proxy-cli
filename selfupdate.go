@@ -144,13 +144,13 @@ func (a *App) inspectSelfUpdateTarget() (selfUpdateTarget, error) {
 		return t, fmt.Errorf("管理領域のcsqlではないため更新できません。公式セットアップ、または csql setup --path で管理領域へ配置してください\n管理先: %s", t.Path)
 	}
 	if t.Binary, err = pathReadChange(t.Path, downloadLimit); err != nil || !t.Binary.Exists {
-		return t, fmt.Errorf("csqlの管理先を確認できません: %s", t.Path)
+		return t, fmt.Errorf("csqlの管理先を確認できません: %s%s", t.Path, selfUpdateRecoveryHint(t.Path))
 	}
 	t.Receipt, err = pathReadChange(filepath.Join(a.Paths.ConfigDir, "binary-install.json"), settingsLimit)
 	var receipt binaryReceipt
 	hash := sha256.Sum256(t.Binary.Before)
 	if err != nil || !t.Receipt.Exists || json.Unmarshal(t.Receipt.Before, &receipt) != nil || receipt.SHA256 != hex.EncodeToString(hash[:]) {
-		return t, fmt.Errorf("csqlの管理記録が一致しません。公式セットアップで配置を確認してください\n%s", t.Path)
+		return t, fmt.Errorf("csqlの管理記録が一致しません。公式セットアップで配置を確認してください\n%s%s", t.Path, selfUpdateRecoveryHint(t.Path))
 	}
 	return t, nil
 }
@@ -296,7 +296,11 @@ func (a *App) checkSelfUpdateBinary(ctx context.Context, path, tag string) error
 	var out bytes.Buffer
 	cmd.Stdout = &limitedWriter{Writer: &out, Remaining: 16 << 10}
 	cmd.Stderr = &limitedWriter{Writer: io.Discard, Remaining: 16 << 10}
-	if err := cmd.Run(); err != nil || strings.TrimSpace(out.String()) != "csql "+strings.TrimPrefix(tag, "v") {
+	err := cmd.Run()
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if err != nil || strings.TrimSpace(out.String()) != "csql "+strings.TrimPrefix(tag, "v") {
 		return fmt.Errorf("更新ファイルの版・起動確認に失敗しました。旧版を維持します")
 	}
 	return ctx.Err()
@@ -315,5 +319,282 @@ func (p *preparedSelfUpdate) Close() error {
 	if !p.retained {
 		return os.RemoveAll(p.StageDir)
 	}
+	return nil
+}
+
+type selfUpdateFileOps struct {
+	Rename       func(string, string) error
+	WriteReceipt func(string, binaryReceipt) error
+}
+
+// setupと同じロックを、接続停止の前に取得して確認内容を再検査する。
+func (p *preparedSelfUpdate) Acquire(ctx context.Context) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed {
+		return fmt.Errorf("更新準備は取り消されています")
+	}
+	if p.unlock != nil {
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	lock := filepath.Join(filepath.Dir(p.Target.Receipt.Path), ".path-lock")
+	if err := pathNoLinks(lock); err != nil {
+		return err
+	}
+	if err := os.Mkdir(lock, 0700); err != nil {
+		return fmt.Errorf("別のsetupまたはupdateが実行中です。完了後に再試行してください")
+	}
+	info, _ := os.Lstat(lock)
+	release := func() {
+		now, err := os.Lstat(lock)
+		if err == nil && info != nil && os.SameFile(now, info) {
+			_ = os.Remove(lock)
+		}
+	}
+	if err := p.unchanged(); err != nil {
+		release()
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		release()
+		return err
+	}
+	p.unlock = release
+	return nil
+}
+func (p *preparedSelfUpdate) unchanged() error {
+	if err := pathUnchanged(p.Target.Binary, downloadLimit); err != nil {
+		return err
+	}
+	if err := pathUnchanged(p.Target.Receipt, settingsLimit); err != nil {
+		return err
+	}
+	b, _, err := pathRead(p.Payload, downloadLimit)
+	if err != nil {
+		return err
+	}
+	sum := sha256.Sum256(b)
+	if int64(len(b)) != p.Offer.Size || hex.EncodeToString(sum[:]) != p.Offer.SHA256 {
+		return fmt.Errorf("検証後に更新ファイルが変更されました")
+	}
+	return nil
+}
+
+type selfUpdateState struct {
+	Schema                                               int
+	ManagedPath, Directory, OldHash, NewHash, Tag, Phase string
+}
+
+func selfUpdatePrevious(p *preparedSelfUpdate) string {
+	return filepath.Join(p.StageDir, "previous-csql"+filepath.Ext(p.Target.Path))
+}
+func (a *App) updateRename(old, next string) error {
+	if a.SelfUpdateOps != nil && a.SelfUpdateOps.Rename != nil {
+		return a.SelfUpdateOps.Rename(old, next)
+	}
+	return os.Rename(old, next)
+}
+
+// ファイルと管理記録を一組で確定し、途中失敗では取消済みctxに依存せず戻す。
+func (a *App) applySelfUpdate(ctx context.Context, p *preparedSelfUpdate) (resultErr error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed || p.unlock == nil {
+		return fmt.Errorf("更新の排他を取得していません")
+	}
+	defer func() {
+		if p.unlock != nil {
+			p.unlock()
+			p.unlock = nil
+		}
+	}()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := p.unchanged(); err != nil {
+		return err
+	}
+	oldHash := sha256.Sum256(p.Target.Binary.Before)
+	state := selfUpdateState{1, p.Target.Path, filepath.Base(p.StageDir), hex.EncodeToString(oldHash[:]), p.Offer.SHA256, p.Offer.Tag, "replacing"}
+	statePath := filepath.Join(p.StageDir, "update-state.json")
+	if err := writeJSON(statePath, state); err != nil {
+		return err
+	}
+	previous := selfUpdatePrevious(p)
+	if err := os.WriteFile(filepath.Join(p.StageDir, "previous-receipt.json"), p.Target.Receipt.Before, 0600); err != nil {
+		return err
+	}
+	moved := false
+	if a.OS == "windows" {
+		if err := a.updateRename(p.Target.Path, previous); err != nil {
+			return fmt.Errorf("旧版を退避できません。他のcsqlを終了して再試行してください: %w", err)
+		}
+		moved = true
+	} else if err := os.WriteFile(previous, p.Target.Binary.Before, p.Target.Binary.Mode); err != nil {
+		return err
+	}
+	p.retained = true
+	rollback := func(cause error) error {
+		var restoreErr error
+		if moved {
+			if a.OS == "windows" {
+				if _, err := os.Lstat(p.Target.Path); err == nil {
+					restoreErr = a.updateRename(p.Target.Path, filepath.Join(p.StageDir, "failed-new.exe"))
+				}
+			}
+			if restoreErr == nil {
+				restoreErr = a.updateRename(previous, p.Target.Path)
+			}
+		}
+		now, err := pathReadChange(p.Target.Receipt.Path, settingsLimit)
+		if err == nil {
+			now.After = p.Target.Receipt.Before
+			now.NewMode = p.Target.Receipt.Mode
+			err = pathApply(now, settingsLimit, false, io.Discard)
+		}
+		if restoreErr == nil {
+			restoreErr = err
+		}
+		if restoreErr != nil {
+			return fmt.Errorf("更新に失敗し、旧版/管理記録の復元も完了できませんでした。\n原因: %v\n復元: %v\n旧版: %s\n新版/作業先: %s\n管理記録: %s\n次の操作: 現在の配置を退避し、旧版の公式セットアップで復旧してください（%s setup --path）", cause, restoreErr, previous, p.StageDir, p.Target.Receipt.Path, shellQuote(previous))
+		}
+		p.retained = false
+		return fmt.Errorf("更新に失敗しました。旧版と管理記録を復元しました: %w", cause)
+	}
+	if err := a.updateRename(p.Payload, p.Target.Path); err != nil {
+		return rollback(err)
+	}
+	moved = true
+	if err := a.checkSelfUpdateBinary(ctx, p.Target.Path, p.Offer.Tag); err != nil {
+		return rollback(err)
+	}
+	receipt := binaryReceipt{p.Offer.SHA256}
+	write := func(path string, r binaryReceipt) error { return writeJSON(path, r) }
+	if a.SelfUpdateOps != nil && a.SelfUpdateOps.WriteReceipt != nil {
+		write = a.SelfUpdateOps.WriteReceipt
+	}
+	if err := write(p.Target.Receipt.Path, receipt); err != nil {
+		return rollback(err)
+	}
+	state.Phase = "committed"
+	if err := writeJSON(statePath, state); err != nil {
+		return rollback(err)
+	}
+	a.cleanupSelfUpdateBackups(p)
+	return nil
+}
+
+// 所有記録と旧版hashが一致する、確定済みの旧バックアップだけを整理する。
+func readSelfUpdateState(dir, target string) (selfUpdateState, bool) {
+	var s selfUpdateState
+	b, _, err := pathRead(filepath.Join(dir, "update-state.json"), settingsLimit)
+	if err != nil || json.Unmarshal(b, &s) != nil || s.Schema != 1 || s.ManagedPath != target || s.Directory != filepath.Base(dir) || !strings.HasPrefix(s.Directory, ".csql-update-") {
+		return s, false
+	}
+	for _, hash := range []string{s.OldHash, s.NewHash} {
+		decoded, e := hex.DecodeString(hash)
+		if e != nil || len(decoded) != 32 {
+			return s, false
+		}
+	}
+	if _, ok := parseReleaseVersion(s.Tag); !ok {
+		return s, false
+	}
+	return s, true
+}
+func (a *App) cleanupSelfUpdateBackups(current *preparedSelfUpdate) {
+	dirs, _ := filepath.Glob(filepath.Join(filepath.Dir(current.Target.Path), ".csql-update-*"))
+	for _, dir := range dirs {
+		if dir == current.StageDir {
+			continue
+		}
+		s, ok := readSelfUpdateState(dir, current.Target.Path)
+		if !ok || s.Phase != "committed" {
+			continue
+		}
+		previous := filepath.Join(dir, "previous-csql"+filepath.Ext(current.Target.Path))
+		b, _, err := pathRead(previous, downloadLimit)
+		sum := sha256.Sum256(b)
+		if err != nil || hex.EncodeToString(sum[:]) != s.OldHash {
+			continue
+		}
+		entries, err := os.ReadDir(dir)
+		if err != nil || len(entries) != 3 {
+			continue
+		}
+		known := true
+		for _, e := range entries {
+			if e.Name() != filepath.Base(previous) && e.Name() != "update-state.json" && e.Name() != "previous-receipt.json" {
+				known = false
+			}
+		}
+		if !known {
+			continue
+		}
+		// Windowsで旧プロセスが使用中なら記録も残し、次回に再検査できるようにする。
+		if os.Remove(previous) != nil {
+			continue
+		}
+		_ = os.Remove(filepath.Join(dir, "previous-receipt.json"))
+		_ = os.Remove(filepath.Join(dir, "update-state.json"))
+		_ = os.Remove(dir)
+	}
+}
+func selfUpdateRecoveryHint(target string) string {
+	dirs, _ := filepath.Glob(filepath.Join(filepath.Dir(target), ".csql-update-*"))
+	for _, dir := range dirs {
+		s, ok := readSelfUpdateState(dir, target)
+		if !ok {
+			continue
+		}
+		old := filepath.Join(dir, "previous-csql"+filepath.Ext(target))
+		b, _, err := pathRead(old, downloadLimit)
+		sum := sha256.Sum256(b)
+		if err == nil && hex.EncodeToString(sum[:]) == s.OldHash {
+			return "\n旧版の復旧先: " + old + "\n次の操作: " + shellQuote(old) + " setup --path（現在の配置を退避してから公式セットアップで復旧してください）"
+		}
+	}
+	return ""
+}
+func (a *App) UpdateSelf(ctx context.Context) error {
+	if !a.TTY {
+		return usageError{fmt.Errorf("csql updateは対話端末から実行してください")}
+	}
+	target, err := a.inspectSelfUpdateTarget()
+	if err != nil {
+		return err
+	}
+	offer, err := a.fetchSelfUpdate(ctx)
+	if err != nil {
+		return err
+	}
+	if offer == nil {
+		fmt.Fprintf(a.stdout(), "csql %s は最新版です。変更はありません。\n", version)
+		return nil
+	}
+	fmt.Fprintf(a.stdout(), "csql %s → %s\n配布元: %s\n更新先: %s\n", version, offer.Tag, offer.URL, target.Path)
+	ok, err := a.confirm(ctx, "この内容でcsqlを更新しますか？ [y/N]")
+	if err != nil {
+		return err
+	}
+	if !ok {
+		fmt.Fprintln(a.stdout(), "更新を取り消しました")
+		return nil
+	}
+	p, err := a.prepareSelfUpdate(ctx, *offer, target, nil)
+	if err != nil {
+		return err
+	}
+	defer p.Close()
+	if err = p.Acquire(ctx); err != nil {
+		return err
+	}
+	if err = a.applySelfUpdate(ctx, p); err != nil {
+		return err
+	}
+	fmt.Fprintf(a.stdout(), "csql %s に更新しました。次回起動から利用できます。\n", strings.TrimPrefix(offer.Tag, "v"))
 	return nil
 }

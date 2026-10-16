@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -13,6 +15,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 // 正式な配布物の欠落や別OSの選択で、意図しないバイナリを取得しない。
@@ -192,6 +195,226 @@ func TestSelfUpdatePreparation(t *testing.T) {
 			dirs, _ := filepath.Glob(filepath.Join(a.Paths.ConfigDir, "bin", ".csql-update-*"))
 			if len(dirs) != 0 {
 				t.Fatal("中間ファイルが残存", dirs)
+			}
+		})
+	}
+}
+
+func selfUpdatePrepared(t *testing.T, a *App) *preparedSelfUpdate {
+	t.Helper()
+	a.OS, a.Arch = runtime.GOOS, runtime.GOARCH
+	target := selfUpdateTestTarget(t, a)
+	exe, _ := os.Executable()
+	data, err := os.ReadFile(exe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(data)
+	offer := selfUpdateOffer{Tag: "v0.8.0", Name: "payload", URL: "https://github.com/y-onishi-0024/cloud-sql-proxy-cli/releases/download/v0.8.0/payload", SHA256: hex.EncodeToString(sum[:]), Size: int64(len(data))}
+	t.Setenv("CSQL_TEST_SELF_UPDATE_VERSION", "0.8.0")
+	a.HTTP = &http.Client{Transport: updateTransport(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(bytes.NewReader(data)), ContentLength: int64(len(data)), Header: make(http.Header)}, nil
+	})}
+	p, err := a.prepareSelfUpdate(context.Background(), offer, target, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { p.Close() })
+	return p
+}
+
+// 配置の各失敗点と競合から、旧版/管理記録を壊さず復帰できる。
+func TestSelfUpdateApplyContract(t *testing.T) {
+	for _, mode := range []string{"ok", "lock", "changed", "new-rename", "old-rename", "version", "receipt", "rollback", "managed", "receipt-mismatch", "link"} {
+		t.Run(mode, func(t *testing.T) {
+			a, _, _ := testApp(t)
+			p := selfUpdatePrepared(t, a)
+			preserved := []string{filepath.Join(a.Paths.ConfigDir, "profiles.json"), filepath.Join(a.Paths.ToolsDir, "installed.json"), filepath.Join(filepath.Dir(a.Paths.ConfigDir), ".zshrc")}
+			for _, path := range preserved {
+				os.MkdirAll(filepath.Dir(path), 0700)
+				os.WriteFile(path, []byte("keep setting"), 0600)
+			}
+			if mode == "managed" {
+				a.Executable = func() (string, error) { return "/elsewhere/csql", nil }
+				if _, err := a.inspectSelfUpdateTarget(); err == nil {
+					t.Fatal("管理外へ書込み可能")
+				}
+				return
+			}
+			if mode == "receipt-mismatch" {
+				writeJSON(p.Target.Receipt.Path, binaryReceipt{"invalid"})
+				if _, err := a.inspectSelfUpdateTarget(); err == nil {
+					t.Fatal("管理記録不一致を受理")
+				}
+				return
+			}
+			if mode == "link" {
+				os.Rename(p.Target.Path, p.Target.Path+"-real")
+				if err := os.Symlink(p.Target.Path+"-real", p.Target.Path); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := a.inspectSelfUpdateTarget(); err == nil {
+					t.Fatal("リンクを受理")
+				}
+				return
+			}
+			if mode == "lock" {
+				if err := os.Mkdir(filepath.Join(a.Paths.ConfigDir, ".path-lock"), 0700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if mode == "changed" {
+				os.WriteFile(p.Target.Path, []byte("other update"), 0700)
+			}
+			if err := p.Acquire(context.Background()); mode == "lock" || mode == "changed" {
+				if err == nil {
+					t.Fatal("競合を受理")
+				}
+				return
+			} else if err != nil {
+				t.Fatal(err)
+			}
+			original := append([]byte{}, p.Target.Binary.Before...)
+			receipt := append([]byte{}, p.Target.Receipt.Before...)
+			if mode == "old-rename" {
+				a.OS = "windows"
+			}
+			a.SelfUpdateOps = &selfUpdateFileOps{
+				Rename: func(old, next string) error {
+					if mode == "new-rename" && old == p.Payload || mode == "old-rename" && old == p.Target.Path || mode == "rollback" && strings.Contains(filepath.Base(old), "previous") {
+						return errors.New("fixture rename failure")
+					}
+					return os.Rename(old, next)
+				}, WriteReceipt: func(path string, value binaryReceipt) error {
+					if mode == "receipt" || mode == "rollback" {
+						os.WriteFile(path, []byte("partial receipt"), 0600)
+						return errors.New("fixture receipt failure")
+					}
+					return writeJSON(path, value)
+				},
+			}
+			if mode == "version" {
+				t.Setenv("CSQL_TEST_SELF_UPDATE_VERSION", "0.9.0")
+			}
+			err := a.applySelfUpdate(context.Background(), p)
+			if mode == "ok" {
+				if err != nil {
+					t.Fatal(err)
+				}
+				data, _ := os.ReadFile(p.Target.Path)
+				sum := sha256.Sum256(data)
+				var r binaryReceipt
+				readJSONFile(p.Target.Receipt.Path, &r)
+				if r.SHA256 != hex.EncodeToString(sum[:]) || r.SHA256 != p.Offer.SHA256 {
+					t.Fatal("新版と記録が不一致")
+				}
+				matches, _ := filepath.Glob(filepath.Join(p.StageDir, "previous-csql*"))
+				if len(matches) != 1 {
+					t.Fatal("旧版バックアップがない")
+				}
+				old, _ := os.ReadFile(matches[0])
+				if !bytes.Equal(old, original) {
+					t.Fatal("旧版が異なる")
+				}
+			} else {
+				if err == nil {
+					t.Fatal("配置失敗を成功と報告")
+				}
+				if mode == "rollback" {
+					if !strings.Contains(err.Error(), "復元") || !strings.Contains(err.Error(), p.StageDir) {
+						t.Fatal("具体的な復旧先がない", err)
+					}
+					return
+				}
+				data, _ := os.ReadFile(p.Target.Path)
+				gotReceipt, _ := os.ReadFile(p.Target.Receipt.Path)
+				if !bytes.Equal(data, original) || !bytes.Equal(gotReceipt, receipt) {
+					t.Fatal("旧版/記録を復元できない", err)
+				}
+			}
+			for _, path := range preserved {
+				b, _ := os.ReadFile(path)
+				if string(b) != "keep setting" {
+					t.Fatal("csql以外の設定を変更", path)
+				}
+			}
+			p.Close()
+			if _, err := os.Stat(filepath.Join(a.Paths.ConfigDir, ".path-lock")); !os.IsNotExist(err) {
+				t.Fatal("更新ロックが残存")
+			}
+		})
+	}
+}
+
+func TestSelfUpdateCLI(t *testing.T) {
+	for _, mode := range []string{"yes", "decline", "latest", "http", "noninteractive", "help", "args"} {
+		t.Run(mode, func(t *testing.T) {
+			a, out, _ := testApp(t)
+			p := selfUpdatePrepared(t, a)
+			p.Close()
+			exe, _ := os.Executable()
+			data, _ := os.ReadFile(exe)
+			sum := sha256.Sum256(data)
+			asset := map[string]any{"name": "csql-0.8.0-" + a.OS + "-" + a.Arch, "size": len(data), "state": "uploaded", "digest": "sha256:" + hex.EncodeToString(sum[:])}
+			release := map[string]any{"tag_name": "v0.8.0", "assets": []any{asset}}
+			if mode == "latest" {
+				release["tag_name"] = "v" + version
+			}
+			body, _ := json.Marshal(release)
+			calls := 0
+			a.HTTP = &http.Client{Transport: updateTransport(func(r *http.Request) (*http.Response, error) {
+				calls++
+				status := 200
+				payload := data
+				if r.URL.Host == "api.github.com" {
+					payload = body
+				}
+				if mode == "http" {
+					status = 403
+				}
+				return &http.Response{StatusCode: status, Body: io.NopCloser(bytes.NewReader(payload)), ContentLength: int64(len(payload)), Header: make(http.Header)}, nil
+			})}
+			a.TTY = mode != "noninteractive"
+			a.In = strings.NewReader("n\n")
+			if mode == "yes" {
+				a.In = strings.NewReader("y\n")
+			}
+			args := []string{"update"}
+			if mode == "help" {
+				args = append(args, "--help")
+			}
+			if mode == "args" {
+				args = append(args, "extra")
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			code := a.Run(ctx, args)
+			switch mode {
+			case "yes":
+				if code != 0 || !strings.Contains(out.String(), "0.8.0") {
+					t.Fatal("更新できない", code, out)
+				}
+			case "decline", "latest", "help":
+				if code != 0 {
+					t.Fatal("安全な取消/照会で失敗", code, out)
+				}
+			default:
+				if code == 0 {
+					t.Fatal("無効な更新を受理")
+				}
+			}
+			if mode == "help" || mode == "args" || mode == "noninteractive" {
+				if calls != 0 {
+					t.Fatal("無効な呼出しで通信")
+				}
+			}
+			contents, _ := os.ReadFile(p.Target.Path)
+			if mode == "yes" {
+				if !bytes.Equal(contents, data) {
+					t.Fatal("更新先が異なる")
+				}
+			} else if string(contents) != "previous csql binary" {
+				t.Fatal("未承認で配置")
 			}
 		})
 	}

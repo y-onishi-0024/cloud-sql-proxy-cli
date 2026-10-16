@@ -75,16 +75,16 @@
 対象: selfupdate.go、selfupdate_unix.go、selfupdate_windows.go、cli.go、selfupdate_test.go、既存pathsetup_test.go。
 入力: 段階1のOffer/Target/準備済みpayload。成果: 管理版だけを確認付きで更新し、失敗時には旧版へ戻せる。
 
-- [ ] `TestSelfUpdateApplyContract`に一時管理領域を用意する。成功時の新版/receipt一致・バックアップの旧版一致・profiles/PATH/ツール無変更、管理外/receipt不一致/リンク、`.path-lock`競合、準備中の配置変更を確認する。競合時は既存ファイルと接続を変えない。
-- [ ] 同testの障害ケースは、旧版退避、新版rename、正式パスversion、receipt書込みをそれぞれ失敗させる。旧版/receiptを戻し、復元自体の失敗では残存先と復旧手順を表示することを検証する。Windows共有違反はrename境界で再現し、成功後に旧版を削除できなくても失敗やプロセス強制終了にしない。
-- [ ] 期待するREDを確認後、Acquire/applySelfUpdate/Closeを実装する。Acquireはsetupと同じmkdir `.path-lock`を用い、既存ロックを消さず即時エラー。最終適用前にpayloadのハッシュ・経路とBinary/Receipt snapshotを再検査する。UIが停止を始める前にAcquireを済ませる。
-- [ ] バックアップはbin直下の専用dirに置き、`update-state.json`へSchema=1、管理先、旧/新版hash、版、専用dir basename、適用phaseを記録する。受け取った任意パスで削除/配置しない。旧版・receiptの復元用snapshotを確保してから変更する。
-- [ ] Unixは旧版をバックアップして新版を同一filesystem上でrename、Windowsは旧版をバックアップへrenameして新版を正式名へrenameする。ファイルハンドルを閉じてからrenameし、receipt確定前のエラーは取消ctxと独立した短い復元処理で旧版/receiptを復元する。成功/復元後はロックを解放する。
-- [ ] 復旧に必要な旧版を最後まで保持する。以前のバックアップ整理は記録・basename・リンクなし・ハッシュ一致が揃う自作dirだけを対象とし、未確定/使用中/確認不能なdirを消さない。通常のversion/helpには復旧書込みを追加しない。管理先検査で次の更新に状態不整合を見つけても黙って上書きせず、具体的な旧版絶対パスと公式setup復旧コマンドを表示する。電源断の完全原子性を保証しない。
-- [ ] `TestSelfUpdateCLI`は実際の`a.Run(..., []string{"update"})`から、確認拒否/成功/最新版/通信失敗/非対話/追加引数拒否を通す。非対話とhelpはHTTPや配置を開始しない。確認文に現在版→新版・公式配布元・絶対配置先、終了結果に版/復旧案内があることを確かめる。
-- [ ] UpdateSelfとCobraの引数0のupdateコマンドを実装する。確認は既存a.confirmを利用し既定N。単独updateは再起動や既存Proxyの停止を行わず、新版番号を表示して終了する。
-- [ ] OS別restartSelfUpdateを実装する。Unixは復元済み端末の既存FDを維持してexec、Windowsは新しいconsole/process groupを作らずstdin/stdout/stderrを渡してRun/Waitする。古い親は入力を読まない。Windowsの子は自分で終了処理を行い、親ctx取消でCommandContext.Killを発生させない。子の失敗/終了を成功とすり替えない。
-- [ ] focused `go test -race ./... -run 'TestSelfUpdate|TestSetupPath' -count=1`をPASSさせる。Mac一時領域の実バイナリでversion置換を確認し、実インストールは触らない。段階1との整合を確認して関連変更をコミットする。
+- [x] `TestSelfUpdateApplyContract`に一時管理領域を用意する。成功時の新版/receipt一致・バックアップの旧版一致・profiles/PATH/ツール無変更、管理外/receipt不一致/リンク、`.path-lock`競合、準備中の配置変更を確認する。競合時は既存ファイルと接続を変えない。
+- [x] 同testの障害ケースは、旧版退避、新版rename、正式パスversion、receipt書込みをそれぞれ失敗させる。旧版/receiptを戻し、復元自体の失敗では残存先と復旧手順を表示することを検証する。Windows共有違反はrename境界で再現し、成功後に旧版を削除できなくても失敗やプロセス強制終了にしない。
+- [x] 期待するREDを確認後、Acquire/applySelfUpdate/Closeを実装する。Acquireはsetupと同じmkdir `.path-lock`を用い、既存ロックを消さず即時エラー。最終適用前にpayloadのハッシュ・経路とBinary/Receipt snapshotを再検査する。UIが停止を始める前にAcquireを済ませる。
+- [x] バックアップはbin直下の専用dirに置き、`update-state.json`へSchema=1、管理先、旧/新版hash、版、専用dir basename、適用phaseを記録する。受け取った任意パスで削除/配置しない。旧版・receiptの復元用snapshotを確保してから変更する。
+- [x] Unixは旧版をバックアップして新版を同一filesystem上でrename、Windowsは旧版をバックアップへrenameして新版を正式名へrenameする。ファイルハンドルを閉じてからrenameし、receipt確定前のエラーは取消ctxと独立した短い復元処理で旧版/receiptを復元する。成功/復元後はロックを解放する。
+- [x] 復旧に必要な旧版を最後まで保持する。以前のバックアップ整理は記録・basename・リンクなし・ハッシュ一致が揃う自作dirだけを対象とし、未確定/使用中/確認不能なdirを消さない。通常のversion/helpには復旧書込みを追加しない。管理先検査で次の更新に状態不整合を見つけても黙って上書きせず、具体的な旧版絶対パスと公式setup復旧コマンドを表示する。電源断の完全原子性を保証しない。
+- [x] `TestSelfUpdateCLI`は実際の`a.Run(..., []string{"update"})`から、確認拒否/成功/最新版/通信失敗/非対話/追加引数拒否を通す。非対話とhelpはHTTPや配置を開始しない。確認文に現在版→新版・公式配布元・絶対配置先、終了結果に版/復旧案内があることを確かめる。
+- [x] UpdateSelfとCobraの引数0のupdateコマンドを実装する。確認は既存a.confirmを利用し既定N。単独updateは再起動や既存Proxyの停止を行わず、新版番号を表示して終了する。
+- [x] OS別restartSelfUpdateを実装する。Unixは復元済み端末の既存FDを維持してexec、Windowsは新しいconsole/process groupを作らずstdin/stdout/stderrを渡してRun/Waitする。古い親は入力を読まない。Windowsの子は自分で終了処理を行い、親ctx取消でCommandContext.Killを発生させない。子の失敗/終了を成功とすり替えない。
+- [x] focused `go test -race ./... -run 'TestSelfUpdate|TestSetupPath' -count=1`をPASSさせる。Mac一時領域の実バイナリでversion置換を確認し、実インストールは触らない。段階1との整合を確認して関連変更をコミットする。
 
 ## 段階3: 画面内更新と端末引継ぎ
 

@@ -53,6 +53,8 @@ type App struct {
 	confirmation                          *bufio.Reader
 	ConfirmAction                         func(context.Context, string) (bool, error)
 	CopyText                              func(context.Context, string) error
+	SelfUpdateOps                         *selfUpdateFileOps
+	RestartSelf                           func(string) error
 }
 type synchronizedWriter struct {
 	writer io.Writer
@@ -198,6 +200,7 @@ func (a *App) Run(ctx context.Context, args []string) int {
 	connectFlags(c)
 	root.AddCommand(c)
 	root.AddCommand(a.profileCommand())
+	root.AddCommand(&cobra.Command{Use: "update", Short: "確認してcsql本体を最新版へ更新", Args: argCount(0, 0), RunE: func(c *cobra.Command, _ []string) error { return a.UpdateSelf(c.Context()) }})
 	l := &cobra.Command{Use: "list [検索文字列]", Short: "インスタンス一覧", Args: argCount(0, 1), RunE: func(cmd *cobra.Command, args []string) error {
 		p, _ := cmd.Flags().GetString("project")
 		r, _ := cmd.Flags().GetBool("refresh")
