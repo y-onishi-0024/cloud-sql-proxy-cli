@@ -776,6 +776,36 @@ func readUIHelp(m *connectUI) string {
 	m.Update(tea.KeyMsg{Type: tea.KeyF1})
 	return all.String() + body.String()
 }
+
+// 保存専用コマンドの操作メニューから、意図せずProxyを開始しない。
+func TestProfileAddActionMenuRemainsSaveOnly(t *testing.T) {
+	for _, tab := range []connectionTab{tabInstances, tabProfiles} {
+		t.Run(fmt.Sprint(tab), func(t *testing.T) {
+			a, _, _ := testApp(t)
+			h := newConnectionsHarness(t, a)
+			h.m.addOnly = true
+			h.m.tab = tab
+			h.m.profiles = []Profile{{Name: "existing", Instance: testInstance(), Port: 55441}}
+			key := "ctrl+k"
+			if tab == tabProfiles {
+				key = "ctrl+o"
+			}
+			h.key(key)
+			h.key("connect")
+			h.key("enter")
+			if len(h.m.connections) != 0 || h.m.state != "actions" {
+				t.Fatal("保存専用画面から接続を開始した")
+			}
+			h.update(tea.KeyMsg{Type: tea.KeyCtrlU})
+			h.key("save")
+			h.key("enter")
+			if h.m.state != "form" {
+				t.Fatal("保存専用画面から設定保存へ進めない")
+			}
+		})
+	}
+}
+
 func TestConnectionsDashboardContract(t *testing.T) {
 	a, _, _ := testApp(t)
 	h := newConnectionsHarness(t, a)

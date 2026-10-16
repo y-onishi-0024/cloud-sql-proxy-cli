@@ -600,7 +600,10 @@ func (m *connectUI) availableActions() []uiAction {
 		if b.profile.ConnectionName == "" {
 			reason = "接続先を選択してください"
 		}
-		add("connect", "接続", "connect", reason)
+		// profile addは保存専用。共通メニューでも接続を許可しない。
+		if !m.addOnly {
+			add("connect", "接続", "connect", reason)
+		}
 		add("save", "保存・別名保存  Ctrl+S", "save", reason)
 		if b.location.tab == tabProfiles {
 			add("port", "ポート変更", "port", reason)
