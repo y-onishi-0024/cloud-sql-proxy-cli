@@ -52,6 +52,7 @@ type App struct {
 	UserPath                              userPathStore
 	confirmation                          *bufio.Reader
 	ConfirmAction                         func(context.Context, string) (bool, error)
+	CopyText                              func(context.Context, string) error
 }
 type synchronizedWriter struct {
 	writer io.Writer

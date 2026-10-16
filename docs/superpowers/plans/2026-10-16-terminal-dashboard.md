@@ -41,13 +41,13 @@
 - `type RecoveryCommand struct { Label, Text string }`を`diagnostics.go`に置き、`Diagnostic.Commands []RecoveryCommand`を加える。既存のSummary/Cause/Next/Detailと`formatDiagnostic`は保つ。
 - Appに`CopyText func(context.Context, string) error`を加える。`func (a *App) copyText(ctx context.Context, text string) error`が実行と後処理を合わせて最大2秒の予算を設け、差替えがあれば使用し、通常はOS別コマンドを起動する。
 
-- [ ] 既存`TestDiagnosticRecovery`とWindows/未導入の検証へ、通常ADC・検索認証・明示ADC・未導入・ポート競合・不明エラーのCommandsを追加する。外部ログの「次の操作」や秘密値をコピー候補へ採用しないことを確認する。型未定義だけのコンパイル失敗を機能のREDとは数えない。
-- [ ] `explainFailure`の既存分岐でCommandsを設定する。検索認証は引用済みgcloudの`auth login`、通常ADCは`auth application-default login`。明示ADC・権限・API・通信・設定・不明は`csql doctor`、ポート競合は`csql status`と`csql profile list`、ツール不足は`csql doctor`と`csql setup --install`。gcloud未導入なら認証コマンドを有効な候補にせず導入の2件を優先する。
-- [ ] SnapshotでCommandsのスライスを複製し、診断の共有データを画面側から書き換えない。
-- [ ] `TestClipboardBackendExecution`で偽の子プロセスへ日本語・空白・単引用符・二重引用符を含むコマンドを渡し、stdinのバイト列が原文のまま、argvに入力テキストが混ざらないことを確認する。macOS/Windows/Linuxの実行選択と固定引数を同じテストで検証し、利用者の実クリップボードは使わない。
-- [ ] `copyText`は`exec.CommandContext`に引数配列とstdinを別々に渡す。macOSは`pbcopy`、Windowsは`powershell.exe -NoLogo -NoProfile -NonInteractive -Command`と固定のUTF-8読込み・Set-Clipboard処理。LinuxはWAYLAND_DISPLAYがあれば`wl-copy`を優先し、それ以外は`xclip -selection clipboard -in`を優先、見つからなければ他方を探す。ツールの導入・shell経由の実行・OSC52を行わない。
-- [ ] `TestClipboardFailures`で未導入、子の非0終了、2秒上限、親context取消を確認する。実行contextを最大1.8秒、`WaitDelay`を200msとし、実行後に別の2秒待機を積み上げない。子の出力は既存`limitedWriter`で最大16KiBとする。これはOS外部境界の統合検証とし、単純な委譲回数のテストは作らない。
-- [ ] focused raceを実行し、診断CLI・ログの秘密除去・既存の失敗保持が回帰しないことを確認してローカルコミットする。
+- [x] 既存`TestDiagnosticRecovery`とWindows/未導入の検証へ、通常ADC・検索認証・明示ADC・未導入・ポート競合・不明エラーのCommandsを追加する。外部ログの「次の操作」や秘密値をコピー候補へ採用しないことを確認する。型未定義だけのコンパイル失敗を機能のREDとは数えない。
+- [x] `explainFailure`の既存分岐でCommandsを設定する。検索認証は引用済みgcloudの`auth login`、通常ADCは`auth application-default login`。明示ADC・権限・API・通信・設定・不明は`csql doctor`、ポート競合は`csql status`と`csql profile list`、ツール不足は`csql doctor`と`csql setup --install`。gcloud未導入なら認証コマンドを有効な候補にせず導入の2件を優先する。
+- [x] SnapshotでCommandsのスライスを複製し、診断の共有データを画面側から書き換えない。
+- [x] `TestClipboardBackendExecution`で偽の子プロセスへ日本語・空白・単引用符・二重引用符を含むコマンドを渡し、stdinのバイト列が原文のまま、argvに入力テキストが混ざらないことを確認する。macOS/Windows/Linuxの実行選択と固定引数を同じテストで検証し、利用者の実クリップボードは使わない。
+- [x] `copyText`は`exec.CommandContext`に引数配列とstdinを別々に渡す。macOSは`pbcopy`、Windowsは`powershell.exe -NoLogo -NoProfile -NonInteractive -Command`と固定のUTF-8読込み・Set-Clipboard処理。LinuxはWAYLAND_DISPLAYがあれば`wl-copy`を優先し、それ以外は`xclip -selection clipboard -in`を優先、見つからなければ他方を探す。ツールの導入・shell経由の実行・OSC52を行わない。
+- [x] `TestClipboardFailures`で未導入、子の非0終了、2秒上限、親context取消を確認する。実行contextを最大1.8秒、`WaitDelay`を200msとし、実行後に別の2秒待機を積み上げない。子の出力は既存`limitedWriter`で最大16KiBとする。これはOS外部境界の統合検証とし、単純な委譲回数のテストは作らない。
+- [x] focused raceを実行し、診断CLI・ログの秘密除去・既存の失敗保持が回帰しないことを確認してローカルコミットする。
 
 focused: `go test -race ./... -run 'TestDiagnostic|TestProxyLog|TestProxyRetains|TestClipboard' -count=1`。
 
