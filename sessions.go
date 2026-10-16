@@ -309,6 +309,12 @@ func (a *App) Connect(ctx context.Context, v Instance, opt ConnectOptions) (retE
 	if err != nil {
 		return err
 	}
+	// 設定を読む前に排他し、管理記録の公開までポート編集を待たせる。
+	unlockProfiles, err := a.lockProfileStore(ctx)
+	if err != nil {
+		return err
+	}
+	defer unlockProfiles()
 	port, releasePort, err := a.reserveProxyPort(v, opt.Port)
 	if err != nil {
 		return diagnosticError{a.failureContext(ctx, "local", "Proxy起動", v, opt.PrivateIP), err}
@@ -461,6 +467,7 @@ func (a *App) Connect(ctx context.Context, v Instance, opt ConnectOptions) (retE
 			retErr = errors.Join(retErr, fmt.Errorf("管理情報を削除できません: %w", err))
 		}
 	}()
+	unlockProfiles()
 	progress.mu.Lock()
 	progress.snapshot.Session = record.SessionStatus
 	progress.snapshot.Revision++

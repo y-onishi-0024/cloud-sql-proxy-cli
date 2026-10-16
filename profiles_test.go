@@ -89,6 +89,118 @@ func TestProfileCLIAndExports(t *testing.T) {
 	}
 }
 
+// CLI更新で同じインスタンスの設定をまとめて変更し、再読込・全出力へ反映する。
+func TestProfilePortUpdateCLI(t *testing.T) {
+	a, out, errs := testApp(t)
+	p := Profile{Name: "dev", Instance: testInstance(), Database: "app", Username: "reader", Port: 5432}
+	for _, name := range []string{"dev", "report"} {
+		p.Name = name
+		p.Database = name
+		if err := a.AddProfile(context.Background(), p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	p.Name = "other"
+	p.Database = "other"
+	p.Instance.Name = "other"
+	p.ConnectionName = "alpha:asia-northeast1:other"
+	p.Port = 65432
+	if err := a.AddProfile(context.Background(), p); err != nil {
+		t.Fatal(err)
+	}
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := l.Addr().(*net.TCPAddr).Port
+	l.Close()
+	if code := a.Run(context.Background(), []string{"profile", "update", "dev", "--port", fmt.Sprint(port)}); code != 0 {
+		t.Fatalf("更新できない: %d %s", code, errs)
+	}
+	b, _, _ := testApp(t)
+	b.Paths = a.Paths
+	rows, err := b.LoadProfiles()
+	if err != nil || len(rows) != 3 {
+		t.Fatalf("再読込: %+v %v", rows, err)
+	}
+	for _, row := range rows {
+		want := port
+		if row.Name == "other" {
+			want = 65432
+		}
+		if row.Port != want || row.Database != row.Name || row.Username != "reader" {
+			t.Fatalf("設定を破損: %+v", row)
+		}
+	}
+	for _, format := range []string{"pgadmin", "dbeaver", "a5", "uri"} {
+		out.Reset()
+		if code := a.Run(context.Background(), []string{"profile", "export", "report", "--format", format}); code != 0 || !strings.Contains(out.String(), fmt.Sprint(port)) {
+			t.Fatalf("%sが旧ポート: %s %s", format, out, errs)
+		}
+	}
+	file := filepath.Join(a.Paths.ConfigDir, "profiles.json")
+	before, _ := os.ReadFile(file)
+	for _, args := range [][]string{{"profile", "update", "missing", "--port", fmt.Sprint(port)}, {"profile", "update", "dev", "--port", "0"}, {"profile", "update", "dev", "--port", "65536"}, {"profile", "update", "dev"}, {"profile", "update", "dev", "--port", "65432"}} {
+		if code := a.Run(context.Background(), args); code == 0 {
+			t.Fatalf("不正更新を許可: %v", args)
+		}
+		after, _ := os.ReadFile(file)
+		if !bytes.Equal(before, after) {
+			t.Fatal("失敗時に設定を変更")
+		}
+	}
+}
+
+// 拒否・同時編集・取消で既存設定を書き換えず、同じ値は無変更で成功する。
+func TestProfilePortUpdateGuards(t *testing.T) {
+	a, _, _ := testApp(t)
+	p := Profile{Name: "dev", Instance: testInstance(), Database: "app", Username: "reader", Port: 5432}
+	if err := a.AddProfile(context.Background(), p); err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(a.Paths.ConfigDir, "profiles.json")
+	before, _ := os.ReadFile(file)
+	busy, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer busy.Close()
+	port := busy.Addr().(*net.TCPAddr).Port
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	for _, tc := range []struct {
+		ctx       context.Context
+		old, port int
+	}{{context.Background(), 5432, port}, {context.Background(), 5433, 15432}, {cancelled, 5432, 15432}} {
+		if _, err := a.UpdateProfilePort(tc.ctx, "dev", tc.old, tc.port); err == nil {
+			t.Fatal("拒否すべき更新が成功")
+		}
+		after, _ := os.ReadFile(file)
+		if !bytes.Equal(before, after) {
+			t.Fatal("拒否時に設定を変更")
+		}
+	}
+	info, _ := os.Stat(file)
+	if _, err := a.UpdateProfilePort(context.Background(), "dev", 5432, 5432); err != nil {
+		t.Fatal(err)
+	}
+	afterInfo, _ := os.Stat(file)
+	if !os.SameFile(info, afterInfo) {
+		t.Fatal("同じ値で設定を再配置")
+	}
+	r := sessionRecord{SessionStatus: SessionStatus{ID: strings.Repeat("a", 32), Project: p.Project, Name: p.Instance.Name, Region: p.Region, DatabaseVersion: p.DatabaseVersion, State: "running", Port: p.Port}, ControlPort: 1, Token: strings.Repeat("b", 64), ProtocolVersion: sessionProtocolVersion}
+	if err := writeJSON(filepath.Join(a.Paths.ConfigDir, "sessions", r.ID+".json"), r); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.UpdateProfilePort(context.Background(), "dev", 5432, 15432); err == nil || !strings.Contains(err.Error(), "csql stop") {
+		t.Fatalf("応答不明を無視: %v", err)
+	}
+	after, _ := os.ReadFile(file)
+	if !bytes.Equal(before, after) {
+		t.Fatal("応答不明で設定を変更")
+	}
+}
+
 // 標準ポートを避け、使用中・別インスタンスの予約済みポートも飛ばして保存候補を選ぶ。
 func TestProfileAutomaticPorts(t *testing.T) {
 	for _, tc := range []struct {
@@ -249,6 +361,15 @@ func TestProfilesConcurrentProcesses(t *testing.T) {
 			<-timer.C
 			return
 		}
+		if mode == "connect" {
+			a = proxyApp(t)
+			a.Paths.ConfigDir = os.Getenv("CSQL_PROFILE_DIR")
+			fmt.Println("waiting")
+			if err := a.Connect(context.Background(), testInstance(), ConnectOptions{Progress: &connectionProgress{}}); err != nil {
+				t.Fatal(err)
+			}
+			return
+		}
 		p := Profile{Name: mode, Instance: testInstance(), Database: "app", Username: "reader", Port: 55435}
 		fmt.Println("waiting")
 		if err := a.AddProfile(context.Background(), p); err != nil {
@@ -312,6 +433,39 @@ func TestProfilesConcurrentProcesses(t *testing.T) {
 	if err != nil || len(rows) != 2 {
 		t.Fatalf("同時保存を喪失: %+v %v", rows, err)
 	}
+	// 別プロセスの起動も編集ロックを待ち、ロック内で確定した新しい設定を読む。
+	owner = start("lock")
+	connecting := start("connect")
+	deadline := time.Now().Add(200 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		records, err := a.records()
+		if err != nil || len(records) != 0 {
+			t.Fatalf("ロック中に子を起動: %+v %v", records, err)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	for i := range rows {
+		rows[i].Port = 55436
+	}
+	if err := a.writeProfiles(rows); err != nil {
+		t.Fatal(err)
+	}
+	_ = owner.Process.Kill()
+	_ = owner.Wait()
+	session := awaitSession(t, a)
+	if session.Port != 55436 {
+		t.Fatalf("別プロセスが旧設定で起動: %+v", session)
+	}
+	if _, err := a.UpdateProfilePort(context.Background(), "one", 55436, 55437); err == nil {
+		t.Fatal("別プロセス稼働中の編集を許可")
+	}
+	if err := a.Stop(context.Background(), session.ID, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := connecting.Wait(); err != nil {
+		t.Fatal(err)
+	}
+
 }
 
 // DBツールへ渡すファイルが、実ポート・日本語・引用符を壊さずパスワードを含めないことをCLIから確認する。
