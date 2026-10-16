@@ -144,13 +144,13 @@ func (a *App) inspectSelfUpdateTarget() (selfUpdateTarget, error) {
 		return t, fmt.Errorf("管理領域のcsqlではないため更新できません。公式セットアップ、または csql setup --path で管理領域へ配置してください\n管理先: %s", t.Path)
 	}
 	if t.Binary, err = pathReadChange(t.Path, downloadLimit); err != nil || !t.Binary.Exists {
-		return t, fmt.Errorf("csqlの管理先を確認できません: %s%s", t.Path, selfUpdateRecoveryHint(t.Path))
+		return t, fmt.Errorf("csqlの管理先を確認できません: %s%s", t.Path, selfUpdateRecoveryHint(a.OS, t.Path))
 	}
 	t.Receipt, err = pathReadChange(filepath.Join(a.Paths.ConfigDir, "binary-install.json"), settingsLimit)
 	var receipt binaryReceipt
 	hash := sha256.Sum256(t.Binary.Before)
 	if err != nil || !t.Receipt.Exists || json.Unmarshal(t.Receipt.Before, &receipt) != nil || receipt.SHA256 != hex.EncodeToString(hash[:]) {
-		return t, fmt.Errorf("csqlの管理記録が一致しません。公式セットアップで配置を確認してください\n%s%s", t.Path, selfUpdateRecoveryHint(t.Path))
+		return t, fmt.Errorf("csqlの管理記録が一致しません。公式セットアップで配置を確認してください\n%s%s", t.Path, selfUpdateRecoveryHint(a.OS, t.Path))
 	}
 	return t, nil
 }
@@ -459,7 +459,22 @@ func (a *App) applySelfUpdate(ctx context.Context, p *preparedSelfUpdate) (resul
 			restoreErr = err
 		}
 		if restoreErr != nil {
-			return fmt.Errorf("更新に失敗し、旧版/管理記録の復元も完了できませんでした。\n原因: %v\n復元: %v\n旧版: %s\n新版/作業先: %s\n管理記録: %s\n次の操作: 現在の配置を退避し、旧版の公式セットアップで復旧してください（%s setup --path）", cause, restoreErr, previous, p.StageDir, p.Target.Receipt.Path, shellQuote(previous))
+			// rename済みの旧版はpreviousに存在しない。残存実体をhashで確認して案内する。
+			locate := func(hash string, paths ...string) string {
+				for _, path := range paths {
+					b, _, err := pathRead(path, downloadLimit)
+					sum := sha256.Sum256(b)
+					if err == nil && hex.EncodeToString(sum[:]) == hash {
+						return path
+					}
+				}
+				return "確認できません"
+			}
+			oldPath := locate(state.OldHash, previous, p.Target.Path)
+			newPath := locate(state.NewHash, p.Payload, filepath.Join(p.StageDir, "failed-new.exe"), p.Target.Path)
+			savedReceipt := filepath.Join(p.StageDir, "previous-receipt.json")
+			next := selfUpdateRecoveryInstructions(a.OS, oldPath, savedReceipt, p.Target.Receipt.Path)
+			return fmt.Errorf("更新に失敗し、旧版/管理記録の復元も完了できませんでした。\n原因: %v\n復元: %v\n旧版: %s\n新版（ハッシュ一致の残存実体）: %s\n作業先: %s\n退避した管理記録: %s\n正式管理記録: %s\n次の操作: %s", cause, restoreErr, oldPath, newPath, p.StageDir, savedReceipt, p.Target.Receipt.Path, next)
 		}
 		p.retained = false
 		return fmt.Errorf("更新に失敗しました。旧版と管理記録を復元しました: %w", cause)
@@ -543,22 +558,42 @@ func (a *App) cleanupSelfUpdateBackups(current *preparedSelfUpdate) {
 		_ = os.Remove(dir)
 	}
 }
-func selfUpdateRecoveryHint(target string) string {
+func selfUpdateRecoveryHint(goos, target string) string {
 	dirs, _ := filepath.Glob(filepath.Join(filepath.Dir(target), ".csql-update-*"))
 	for _, dir := range dirs {
-		s, ok := readSelfUpdateState(dir, target)
+		state, ok := readSelfUpdateState(dir, target)
 		if !ok {
 			continue
 		}
-		old := filepath.Join(dir, "previous-csql"+filepath.Ext(target))
-		b, _, err := pathRead(old, downloadLimit)
-		sum := sha256.Sum256(b)
-		if err == nil && hex.EncodeToString(sum[:]) == s.OldHash {
-			return "\n旧版の復旧先: " + old + "\n次の操作: " + shellQuote(old) + " setup --path（現在の配置を退避してから公式セットアップで復旧してください）"
+		saved := filepath.Join(dir, "previous-receipt.json")
+		b, _, err := pathRead(saved, settingsLimit)
+		var receipt binaryReceipt
+		if err != nil || json.Unmarshal(b, &receipt) != nil || receipt.SHA256 != state.OldHash {
+			continue
+		}
+		for _, old := range []string{filepath.Join(dir, "previous-csql"+filepath.Ext(target)), target} {
+			b, _, err := pathRead(old, downloadLimit)
+			sum := sha256.Sum256(b)
+			if err == nil && hex.EncodeToString(sum[:]) == state.OldHash {
+				return "\n旧版の復旧先: " + old + "\n退避した管理記録: " + saved + "\n正式管理記録: " + filepath.Join(filepath.Dir(filepath.Dir(target)), "binary-install.json") + "\n次の操作: " + selfUpdateRecoveryInstructions(goos, old, saved, filepath.Join(filepath.Dir(filepath.Dir(target)), "binary-install.json"))
+			}
 		}
 	}
 	return ""
 }
+func selfUpdateRecoveryInstructions(goos, old, saved, receipt string) string {
+	if old == "確認できません" {
+		return "公式Releaseのセットアップから復旧してください: " + updatePage
+	}
+	copyCommand := "cp " + shellQuote(saved) + " " + shellQuote(receipt)
+	setupCommand := shellQuote(old) + " setup --path"
+	if goos == "windows" {
+		copyCommand = "Copy-Item -LiteralPath " + selfUpdatePSQuote(saved) + " -Destination " + selfUpdatePSQuote(receipt) + " -Force"
+		setupCommand = "& " + selfUpdatePSQuote(old) + " setup --path"
+	}
+	return "管理記録先の種類・権限を修復し、通常ファイルとして保存できる状態にしてから記録を戻してください:\n" + copyCommand + "\n現在の配置が旧版と異なる場合は退避してから実行してください:\n" + setupCommand
+}
+
 func (a *App) UpdateSelf(ctx context.Context) error {
 	if !a.TTY {
 		return usageError{fmt.Errorf("csql updateは対話端末から実行してください")}
@@ -598,3 +633,6 @@ func (a *App) UpdateSelf(ctx context.Context) error {
 	fmt.Fprintf(a.stdout(), "csql %s に更新しました。次回起動から利用できます。\n", strings.TrimPrefix(offer.Tag, "v"))
 	return nil
 }
+
+// PowerShellのパスは式へ埋め込まず、リテラルと呼出し演算子で案内する。
+func selfUpdatePSQuote(path string) string { return "'" + strings.ReplaceAll(path, "'", "''") + "'" }

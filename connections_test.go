@@ -1232,3 +1232,98 @@ func TestConnectionsSelfUpdateShutdown(t *testing.T) {
 	}
 	awaitProxyPort(t, ext.Port)
 }
+
+// readyをUIへ配送しない境界から終了・取消・再試行しても準備結果を漏らさない。
+func TestConnectionsSelfUpdateDeliveryContract(t *testing.T) {
+	for _, mode := range []string{"undelivered-exit", "cancel-stale-retry"} {
+		t.Run(mode, func(t *testing.T) {
+			a, _, _ := testApp(t)
+			gate, _, _ := selfUpdateUIFixture(t, a)
+			close(gate)
+			h := newConnectionsHarness(t, a)
+			t.Cleanup(func() {
+				h.m.closeWork()
+				h.m.workers.Wait()
+				if h.m.updateJob != nil {
+					h.m.updateJob.closePrepared()
+				}
+				if h.m.pendingUpdate != nil {
+					h.m.pendingUpdate.Close()
+				}
+			})
+			open := func() {
+				h.key("ctrl+k")
+				h.key("update")
+				h.key("enter")
+				h.pumpUntil(func() bool { return h.m.state == "updateConfirm" }, "更新確認")
+				h.key("tab")
+				h.key("enter")
+			}
+			open()
+			var ready uiSelfUpdateResult
+			timeout := time.NewTimer(6 * time.Second)
+			defer timeout.Stop()
+		waitReady:
+			for {
+				select {
+				case msg := <-h.events:
+					if v, ok := msg.(uiSelfUpdateResult); ok && v.prepared != nil {
+						ready = v
+						break waitReady
+					}
+					h.update(msg)
+				case <-timeout.C:
+					t.Fatal("未配送ready待ちが完了しない")
+				}
+			}
+			h.m.workers.Wait()
+			lock := filepath.Join(a.Paths.ConfigDir, ".path-lock")
+			if _, err := os.Stat(lock); err != nil {
+				t.Fatal("配送前の準備が排他を所有していない", err)
+			}
+			stage := ready.prepared.StageDir
+			if mode == "undelivered-exit" {
+				h.key("ctrl+c")
+				h.m.workers.Wait()
+				// runConnectModelの終了待機後と同じ所有権の解放を通す。
+				h.m.updateJob.closePrepared()
+				h.update(ready)
+				if !h.m.exit || h.m.pendingUpdate != nil {
+					t.Fatal("遅い結果が更新終了へ変化")
+				}
+			} else {
+				h.key("esc")
+				h.update(ready)
+				if h.m.state != "list" || h.m.exit {
+					t.Fatal("取消後に一覧へ戻らない")
+				}
+				h.key("ctrl+k")
+				h.key("update")
+				h.key("enter")
+				h.update(ready) // 終了済みoperationが次の更新を上書きしない。
+				if h.m.state != "updateChecking" || h.m.exit {
+					t.Fatal("古いreadyが新しい操作を更新")
+				}
+				h.pumpUntil(func() bool { return h.m.state == "updateConfirm" }, "再試行の確認")
+				h.key("tab")
+				h.key("enter")
+				h.pumpUntil(func() bool { return h.m.exit }, "再試行ready")
+				if h.m.pendingUpdate == nil || h.m.pendingUpdate.StageDir == stage {
+					t.Fatal("再試行が古い準備を再利用")
+				}
+				h.m.pendingUpdate.Close()
+			}
+			if _, err := os.Stat(stage); !os.IsNotExist(err) {
+				t.Fatal("古いstagingが残留")
+			}
+			if _, err := os.Stat(lock); !os.IsNotExist(err) {
+				t.Fatal("更新ロックが残留")
+			}
+			target := filepath.Join(a.Paths.ConfigDir, "bin", "csql")
+			b, _ := os.ReadFile(target)
+			if string(b) != "previous csql binary" {
+				t.Fatal("取消/未配送の結果が配置を変更")
+			}
+		})
+	}
+}

@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -227,7 +228,7 @@ func selfUpdatePrepared(t *testing.T, a *App) *preparedSelfUpdate {
 
 // 配置の各失敗点と競合から、旧版/管理記録を壊さず復帰できる。
 func TestSelfUpdateApplyContract(t *testing.T) {
-	for _, mode := range []string{"ok", "lock", "changed", "new-rename", "old-rename", "version", "receipt", "rollback", "managed", "receipt-mismatch", "link"} {
+	for _, mode := range []string{"ok", "lock", "changed", "new-rename", "old-rename", "version", "receipt", "rollback", "receipt-restore", "windows-new-rename", "windows-version", "managed", "receipt-mismatch", "link"} {
 		t.Run(mode, func(t *testing.T) {
 			a, _, _ := testApp(t)
 			p := selfUpdatePrepared(t, a)
@@ -278,16 +279,21 @@ func TestSelfUpdateApplyContract(t *testing.T) {
 			}
 			original := append([]byte{}, p.Target.Binary.Before...)
 			receipt := append([]byte{}, p.Target.Receipt.Before...)
-			if mode == "old-rename" {
+			if mode == "old-rename" || strings.HasPrefix(mode, "windows-") {
 				a.OS = "windows"
 			}
 			a.SelfUpdateOps = &selfUpdateFileOps{
 				Rename: func(old, next string) error {
-					if mode == "new-rename" && old == p.Payload || mode == "old-rename" && old == p.Target.Path || mode == "rollback" && strings.Contains(filepath.Base(old), "previous") {
+					if (mode == "new-rename" || mode == "windows-new-rename") && old == p.Payload || mode == "old-rename" && old == p.Target.Path || mode == "rollback" && strings.Contains(filepath.Base(old), "previous") {
 						return errors.New("fixture rename failure")
 					}
 					return os.Rename(old, next)
 				}, WriteReceipt: func(path string, value binaryReceipt) error {
+					if mode == "receipt-restore" {
+						os.Remove(path)
+						os.Mkdir(path, 0700)
+						return errors.New("fixture receipt storage failure")
+					}
 					if mode == "receipt" || mode == "rollback" {
 						os.WriteFile(path, []byte("partial receipt"), 0600)
 						return errors.New("fixture receipt failure")
@@ -321,6 +327,19 @@ func TestSelfUpdateApplyContract(t *testing.T) {
 			} else {
 				if err == nil {
 					t.Fatal("配置失敗を成功と報告")
+				}
+				if mode == "receipt-restore" {
+					if !strings.Contains(err.Error(), "旧版: "+p.Target.Path) || !strings.Contains(err.Error(), filepath.Join(p.StageDir, "previous-receipt.json")) {
+						t.Fatal("実在する旧版と退避した管理記録を案内しない", err)
+					}
+					old, _ := os.ReadFile(p.Target.Path)
+					if !bytes.Equal(old, original) {
+						t.Fatal("旧版の正式パスへの復元が未完了")
+					}
+					if _, e := a.inspectSelfUpdateTarget(); e == nil || !strings.Contains(e.Error(), filepath.Join(p.StageDir, "previous-receipt.json")) {
+						t.Fatal("次回の更新でも復旧先が不明", e)
+					}
+					return
 				}
 				if mode == "rollback" {
 					if !strings.Contains(err.Error(), "復元") || !strings.Contains(err.Error(), p.StageDir) {
@@ -433,11 +452,12 @@ func selfUpdateUIFixture(t *testing.T, a *App) (chan struct{}, chan struct{}, *a
 	asset := map[string]any{"name": "csql-0.8.0-" + a.OS + "-" + a.Arch, "size": len(data), "state": "uploaded", "digest": "sha256:" + hex.EncodeToString(sum[:])}
 	body, _ := json.Marshal(map[string]any{"tag_name": "v0.8.0", "assets": []any{asset}})
 	gate, started := make(chan struct{}), make(chan struct{})
+	var startedOnce sync.Once
 	fail := &atomic.Bool{}
 	a.HTTP = &http.Client{Transport: updateTransport(func(r *http.Request) (*http.Response, error) {
 		payload := body
 		if r.URL.Host != "api.github.com" {
-			close(started)
+			startedOnce.Do(func() { close(started) })
 			select {
 			case <-gate:
 			case <-r.Context().Done():
