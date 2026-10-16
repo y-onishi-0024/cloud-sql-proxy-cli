@@ -221,6 +221,7 @@ type uiResult struct {
 	result                    DiscoveryResult
 	notices                   []string
 	profile                   Profile
+	profiles                  []Profile
 	data                      string
 	err                       error
 }
@@ -238,44 +239,56 @@ type formField struct {
 	label, value string
 	pos          int
 }
+
+// 入力画面から戻る際、検索と選択行を同じ位置へ復元する。
+type listLocation struct {
+	tab              connectionTab
+	query            string
+	inputPos, cursor int
+	connectionID     uint64
+}
 type connectUI struct {
-	a                                 *App
-	ctx                               context.Context
-	request                           connectRequest
-	selector                          selector
-	profiles                          []Profile
-	allInstances                      []Instance
-	tab                               connectionTab
-	connections                       []*uiConnection
-	nextID, selectedID                uint64
-	state                             string
-	frame                             int
-	updateVersion                     string
-	recoveryPage                      int
-	generation                        int
-	searching                         bool
-	cancel                            context.CancelFunc
-	cancelAll                         context.CancelFunc
-	workers                           sync.WaitGroup
-	workMu                            sync.Mutex
-	workClosed                        bool
-	tickEpoch                         uint64
-	tickPending                       bool
-	operation, editOwner, editAttempt uint64
-	editProfile                       Profile
-	fields                            []formField
-	focus                             int
-	formBack                          string
-	addOnly                           bool
-	seed, saved                       Profile
-	message                           string
-	diagnostic                        *Diagnostic
-	showLogs                          bool
-	exportFormat, exportData          string
-	exportCursor                      int
-	exit                              bool
-	resultErr                         error
-	notices                           []string
+	a                                    *App
+	ctx                                  context.Context
+	request                              connectRequest
+	selector                             selector
+	profiles                             []Profile
+	allInstances                         []Instance
+	tab                                  connectionTab
+	connections                          []*uiConnection
+	nextID, selectedID                   uint64
+	state                                string
+	frame                                int
+	updateVersion                        string
+	recoveryPage                         int
+	generation                           int
+	searching                            bool
+	cancel                               context.CancelFunc
+	cancelAll                            context.CancelFunc
+	workers                              sync.WaitGroup
+	workMu                               sync.Mutex
+	workClosed                           bool
+	tickEpoch                            uint64
+	tickPending                          bool
+	operation, editOwner, editAttempt    uint64
+	editProfile                          Profile
+	fields                               []formField
+	focus                                int
+	formBack                             string
+	addOnly                              bool
+	seed, saved                          Profile
+	message                              string
+	diagnostic                           *Diagnostic
+	showLogs                             bool
+	exportFormat, exportData             string
+	exportCursor                         int
+	location                             *listLocation
+	actionCursor, portExpected, portPage int
+	portNames                            []string
+	connectionLogs                       bool
+	exit                                 bool
+	resultErr                            error
+	notices                              []string
 }
 
 // 未配送Cmdを待機数に含めず、ゲート閉鎖後の遅いCmdを実行しない。
@@ -419,6 +432,232 @@ func (m *connectUI) showConnections() {
 		}
 	}
 }
+
+// 一覧での操作は表示中の行を解決し、過去の詳細選択を参照しない。
+func (m *connectUI) actionConnection() *uiConnection {
+	if m.tab != tabConnections {
+		return nil
+	}
+	rows := m.matchedConnections()
+	i := m.selector.cursor
+	if i < 0 || i >= len(rows) {
+		return nil
+	}
+	return rows[i]
+}
+func (m *connectUI) rememberList() {
+	if m.state != "list" {
+		return
+	}
+	loc := &listLocation{tab: m.tab, query: m.selector.query, inputPos: m.selector.inputPos, cursor: m.selector.cursor}
+	if c := m.actionConnection(); c != nil {
+		loc.connectionID = c.id
+		m.selectedID = c.id
+	}
+	m.location = loc
+}
+func (m *connectUI) returnToList() {
+	if m.location == nil {
+		m.state = "list"
+		return
+	}
+	loc := *m.location
+	m.location = nil
+	m.state = "list"
+	m.tab = loc.tab
+	m.selector.query, m.selector.inputPos, m.selector.cursor = loc.query, loc.inputPos, loc.cursor
+	count := len(m.selector.filtered())
+	if m.tab == tabConnections {
+		rows := m.matchedConnections()
+		count = len(rows)
+		for i, c := range rows {
+			if c.id == loc.connectionID {
+				m.selector.cursor = i
+				m.selectedID = c.id
+			}
+		}
+	} else if m.tab == tabProfiles {
+		count = len(m.matchedProfiles())
+	}
+	m.selector.cursor = max(0, min(m.selector.cursor, count-1))
+}
+func (m *connectUI) workspaceActions() []string {
+	if m.tab == tabProfiles {
+		return []string{"ポート変更"}
+	}
+	return []string{"エクスポート  Ctrl+E", "ログ表示/非表示  Ctrl+L", "保存・別名保存  Ctrl+S", "ポート変更", "停止  Ctrl+D", "再試行  Ctrl+R"}
+}
+func (m *connectUI) openActions() {
+	if c := m.actionConnection(); c != nil {
+		m.selectedID = c.id
+		m.editProfile = c.effectiveProfile()
+	} else if p, ok := m.selected(); ok && m.tab == tabProfiles {
+		m.editProfile = p
+	} else {
+		m.message = "操作する行を選択してください"
+		return
+	}
+	m.rememberList()
+	m.actionCursor = 0
+	m.state = "actions"
+	m.message = ""
+}
+func (m *connectUI) workspaceAction(index int) tea.Cmd {
+	c := m.actionConnection()
+	if m.state == "actions" && m.tab == tabConnections {
+		c = m.selectedConnection()
+	}
+	if m.tab == tabProfiles {
+		if index == 3 || m.state == "actions" {
+			m.openPortForm(m.editProfile)
+		}
+		return nil
+	}
+	if c == nil {
+		m.message = "操作する接続を選択してください"
+		return nil
+	}
+	m.selectedID = c.id
+	switch index {
+	case 0:
+		m.openExportMenu()
+	case 1:
+		if m.state == "actions" {
+			m.returnToList()
+		}
+		m.connectionLogs = !m.connectionLogs
+		c.recoveryPage = 0
+	case 2:
+		m.openForm(c.effectiveProfile())
+	case 3:
+		m.openPortForm(c.effectiveProfile())
+	case 4, 5:
+		if m.state == "actions" {
+			m.returnToList()
+		}
+		return m.stopConnection(c.id, index == 5)
+	}
+	return nil
+}
+func (m *connectUI) openPortForm(p Profile) {
+	if m.state == "list" {
+		m.rememberList()
+	}
+	c := m.selectedConnection()
+	if m.tab != tabConnections {
+		c = nil
+	}
+	if c != nil && (c.running || c.stopping) {
+		if m.location != nil {
+			m.returnToList()
+		}
+		m.message = "先に対象Proxyを停止し、停止済みを確認してからPortを変更してください"
+		return
+	}
+	rows, err := m.a.LoadProfiles()
+	if err != nil {
+		m.message = safeLog(err.Error())
+		return
+	}
+	var found *Profile
+	for _, row := range rows {
+		if row.ConnectionName == p.ConnectionName && (found == nil || row.Name == p.Name) {
+			value := row
+			found = &value
+		}
+	}
+	if found == nil {
+		if m.location != nil {
+			m.returnToList()
+		}
+		m.message = "先に接続設定を保存してください"
+		return
+	}
+	m.editProfile = *found
+	m.portExpected = found.Port
+	m.portNames = nil
+	for _, row := range rows {
+		if row.ConnectionName == found.ConnectionName {
+			m.portNames = append(m.portNames, row.Name)
+		}
+	}
+	m.editOwner, m.editAttempt = 0, 0
+	if c != nil {
+		m.editOwner, m.editAttempt = c.id, c.attempt
+	}
+	value := strconv.Itoa(found.Port)
+	m.fields = []formField{{label: "変更先Port", value: value, pos: len(value)}}
+	m.portPage = 0
+	m.state = "portForm"
+	m.message = ""
+}
+func (m *connectUI) savePortForm() tea.Cmd {
+	port, err := strconv.Atoi(m.fields[0].value)
+	if err != nil || port < 1 || port > 65535 {
+		m.message = "Portは1〜65535を指定してください"
+		return nil
+	}
+	m.operation++
+	result := uiResult{kind: "portUpdate", operation: m.operation, owner: m.editOwner, attempt: m.editAttempt, profile: m.editProfile}
+	result.profile.Port = port
+	a, ctx, name, old := m.a, m.ctx, m.editProfile.Name, m.portExpected
+	m.state = "saving"
+	m.message = "保存中…"
+	cancelled := result
+	cancelled.err = context.Canceled
+	return m.work(ctx, cancelled, func() tea.Msg { result.profiles, result.err = a.UpdateProfilePort(ctx, name, old, port); return result })
+}
+
+// 選択行の情報を、一覧を残したまま右または下の領域へ表示する。
+func (m *connectUI) workspacePanel(width, height int) (string, []string, int) {
+	c := m.actionConnection()
+	limit := height - 6
+	if width < 100 || height < 20 {
+		limit = min(5, max(2, height-12))
+	}
+	wrapWidth := max(1, width-8)
+	if width >= 100 && height >= 20 {
+		wrapWidth = max(34, width/3) - 4
+	}
+	title := "接続情報"
+	var lines []string
+	if m.message != "" {
+		lines = append(lines, strings.Split(ansi.Wrap(safeLog(m.message), wrapWidth, ""), "\n")...)
+	}
+	if c != nil {
+		p := c.effectiveProfile()
+		lines = append(lines, c.status(), fmt.Sprintf("Host 127.0.0.1:%d", p.Port), "DB "+p.Database+" / "+p.Username)
+		lines = append(lines, p.Region+" / "+p.DatabaseVersion)
+		if c.progress != nil {
+			if id := c.progress.Snapshot().Session.ID; id != "" {
+				lines = append(lines, "セッション "+id)
+			}
+		}
+		if c.diagnostic != nil {
+			lines = append(lines, strings.Split(ansi.Wrap(safeLog(c.diagnostic.Cause+"\n次の操作: "+c.diagnostic.Next), wrapWidth, ""), "\n")...)
+		}
+		if m.connectionLogs && c.progress != nil {
+			title = "ログ · PgUp/PgDn"
+			logs := strings.Split(ansi.Wrap(strings.Join(c.progress.Snapshot().Logs, "\n"), wrapWidth, ""), "\n")
+			// 通常のログは末尾から過去へ辿る。対処や操作結果は先頭から読めるようにする。
+			if m.message == "" && c.diagnostic == nil {
+				last := max(0, (len(logs)-1)/max(1, limit-1))
+				end := max(0, len(logs)-min(last, c.recoveryPage)*max(1, limit-1))
+				start := max(0, end-max(1, limit-1))
+				return title, append([]string{c.status()}, logs[start:end]...), last
+			}
+			lines = append(lines, "ログ:")
+			lines = append(lines, logs...)
+		}
+		last := max(0, (len(lines)-1)/max(1, limit))
+		start := min(last, c.recoveryPage) * max(1, limit)
+		return title, lines[start:min(len(lines), start+limit)], last
+	}
+	if len(lines) > limit {
+		lines = lines[:limit]
+	}
+	return title, lines, 0
+}
 func (m *connectUI) addConnection() tea.Cmd {
 	m.state = "list"
 	m.tab = tabInstances
@@ -436,12 +675,13 @@ func (m *connectUI) addConnection() tea.Cmd {
 	return nil
 }
 func (m *connectUI) openForm(p Profile) {
+	m.rememberList()
 	m.formBack = m.state
 	if m.formBack == "error" {
 		m.formBack = "list"
 	}
 	m.editOwner, m.editAttempt = 0, 0
-	if m.state == "connecting" {
+	if m.state == "connecting" || ((m.state == "list" || m.state == "actions") && m.tab == tabConnections) {
 		if c := m.selectedConnection(); c != nil {
 			p = c.effectiveProfile()
 			if c.stopping {
@@ -518,6 +758,7 @@ func (m *connectUI) saveForm() tea.Cmd {
 
 // Eで対象接続を固定し、ツール選択中の背景終了でも別接続へ切り替えない。
 func (m *connectUI) openExportMenu() {
+	m.rememberList()
 	c := m.selectedConnection()
 	if c == nil {
 		return
@@ -736,6 +977,13 @@ func (m *connectUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.addOnly {
 				return m, tea.Quit
 			}
+			if m.location != nil {
+				if c := m.connection(v.owner); c != nil && c.attempt == v.attempt {
+					c.profile = v.profile
+				}
+				m.returnToList()
+				return m, nil
+			}
 			if c := m.connection(v.owner); c != nil && c.attempt == v.attempt {
 				c.profile = v.profile
 				m.state = "connecting"
@@ -744,12 +992,29 @@ func (m *connectUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			} else {
 				m.state = m.formBack
 			}
+		case "portUpdate":
+			if v.err != nil {
+				m.state = "portForm"
+				m.message = safeLog(v.err.Error())
+				return m, nil
+			}
+			m.profiles = v.profiles
+			for _, c := range m.connections {
+				if !c.running && c.profile.ConnectionName == v.profile.ConnectionName {
+					c.profile.Port = v.profile.Port
+				}
+			}
+			m.returnToList()
+			m.message = fmt.Sprintf("Portを更新しました: %d → %d\nDBツール側のPortを変更するか再エクスポートしてください", m.portExpected, v.profile.Port)
 		case "export":
 			m.state = "export"
 			if v.err != nil {
 				m.message = safeLog(v.err.Error())
 			} else {
 				m.message = "ファイルへ出力しました: " + v.data + "\n" + exportGuide(m.exportFormat)
+				if m.location != nil {
+					m.returnToList()
+				}
 			}
 		}
 		return m, nil
@@ -775,6 +1040,42 @@ func (m *connectUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		}
+		if m.state == "actions" {
+			if m.tab == tabConnections {
+				indices := map[string]int{"ctrl+e": 0, "ctrl+l": 1, "ctrl+s": 2, "ctrl+d": 4, "ctrl+r": 5}
+				if index, ok := indices[key]; ok {
+					return m, m.workspaceAction(index)
+				}
+			}
+			switch key {
+			case "esc":
+				m.returnToList()
+			case "up", "shift+tab":
+				m.actionCursor = max(0, m.actionCursor-1)
+			case "down", "tab":
+				m.actionCursor = min(len(m.workspaceActions())-1, m.actionCursor+1)
+			case "enter":
+				return m, m.workspaceAction(m.actionCursor)
+			}
+			return m, nil
+		}
+		if m.state == "portForm" {
+			switch key {
+			case "esc":
+				m.returnToList()
+			case "enter", "ctrl+s":
+				return m, m.savePortForm()
+			case "pgup":
+				m.portPage = max(0, m.portPage-1)
+			case "pgdown":
+				width, _ := m.dimensions()
+				count := len(m.portNames) + len(strings.Split(ansi.Wrap(safeLog(m.message), max(1, width-4), ""), "\n"))
+				m.portPage = min(max(0, (count-1)/3), m.portPage+1)
+			default:
+				editText(&m.fields[0].value, &m.fields[0].pos, v)
+			}
+			return m, nil
+		}
 		if m.state == "form" {
 			switch key {
 			case "esc":
@@ -783,6 +1084,9 @@ func (m *connectUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, tea.Quit
 				}
 				m.state = m.formBack
+				if m.location != nil {
+					m.returnToList()
+				}
 			case "tab", "down":
 				m.focus = (m.focus + 1) % len(m.fields)
 			case "shift+tab", "up":
@@ -804,6 +1108,9 @@ func (m *connectUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			switch key {
 			case "esc":
 				m.state = "connecting"
+				if m.location != nil {
+					m.returnToList()
+				}
 				m.message = ""
 			case "up", "shift+tab":
 				m.exportCursor = max(0, m.exportCursor-1)
@@ -870,6 +1177,9 @@ func (m *connectUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		}
 		if (m.state == "list" || m.state == "searching") && key == "tab" {
+			if m.tab == tabConnections && !m.addOnly {
+				return m, m.addConnection()
+			}
 			tabs := 3
 			if m.addOnly {
 				tabs = 2
@@ -892,6 +1202,34 @@ func (m *connectUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.state == "searching" {
 			return m, nil
 		}
+		if m.state == "list" && (m.tab == tabConnections || m.tab == tabProfiles) {
+			if key == "ctrl+o" {
+				m.openActions()
+				return m, nil
+			}
+			if m.tab == tabConnections {
+				indices := map[string]int{"ctrl+e": 0, "ctrl+l": 1, "ctrl+s": 2, "ctrl+d": 4, "ctrl+r": 5}
+				if index, ok := indices[key]; ok {
+					return m, m.workspaceAction(index)
+				}
+				if key == "pgup" || key == "pgdown" {
+					if c := m.actionConnection(); c != nil {
+						width, height := m.dimensions()
+						_, _, last := m.workspacePanel(width, height)
+						next := key == "pgdown"
+						if m.connectionLogs && m.message == "" && c.diagnostic == nil {
+							next = !next
+						}
+						if next {
+							c.recoveryPage = min(last, c.recoveryPage+1)
+						} else {
+							c.recoveryPage = max(0, min(last, c.recoveryPage)-1)
+						}
+					}
+					return m, nil
+				}
+			}
+		}
 		if m.state == "list" {
 			switch key {
 			case "ctrl+s":
@@ -900,12 +1238,7 @@ func (m *connectUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			case "enter":
 				if m.tab == tabConnections {
-					rows := m.matchedConnections()
-					if m.selector.cursor < len(rows) {
-						m.selectedID = rows[m.selector.cursor].id
-						m.state = "connecting"
-						m.message = ""
-					}
+					m.openActions()
 				} else if p, ok := m.selected(); ok {
 					if m.addOnly {
 						m.openForm(p)
@@ -1034,6 +1367,16 @@ func (m *connectUI) View() string {
 				c.rows = append(c.rows, instanceChoice(r))
 			}
 		}
+		if m.tab == tabConnections {
+			c.footer = []string{"↑↓ 選択  Enter 操作  Ctrl+E 出力  Ctrl+L ログ", "Tab 切替  Esc 戻る  Ctrl+C 全接続停止"}
+			c.sideTitle, c.sideLines, _ = m.workspacePanel(width, height)
+		} else if m.message != "" {
+			c.sideTitle = "操作結果"
+			c.sideLines = strings.Split(safeLog(m.message), "\n")
+		}
+		if m.tab == tabProfiles {
+			c.footer = []string{"Enter 接続  Ctrl+O 操作/Port変更  Ctrl+S 別名保存", "Tab 切替  Esc 戻る  Ctrl+C 全接続停止"}
+		}
 		return v.choices(c)
 	}
 	title, badge := "接続ステータス", paint("● 処理中", tuiAccent, v.color)
@@ -1046,6 +1389,30 @@ func (m *connectUI) View() string {
 		badge = paint(spin+" 検索中", tuiAccent, v.color)
 		lines = []string{"", spin + " アクセスできるCloud SQLを取得しています", "", "プロジェクトの数に応じて時間がかかる場合があります"}
 		footer = []string{"Tab 保存済み設定・接続一覧へ切替", "Esc 戻る  Ctrl+C この画面の全接続停止"}
+	case "actions":
+		title = "選択行の操作"
+		lines = []string{m.editProfile.Instance.Name, ""}
+		for i, label := range m.workspaceActions() {
+			marker := "  "
+			if i == m.actionCursor {
+				marker = "› "
+			}
+			lines = append(lines, marker+label)
+		}
+		footer = []string{"↑↓ / Tab 選択  Enter 実行", "Esc 一覧へ戻る  Ctrl+C 全接続停止"}
+	case "portForm":
+		title = "保存済みPortを変更"
+		lines = []string{m.editProfile.Instance.Name, fmt.Sprintf("現在 %d → %s", m.portExpected, m.fields[0].value), "変更先Port  " + inputView(m.fields[0].value, m.fields[0].pos, width-22), "対象設定・案内（PgUp/PgDn）:"}
+		var detail []string
+		if m.message != "" {
+			detail = strings.Split(ansi.Wrap(safeLog(m.message), width-4, ""), "\n")
+		}
+		detail = append(detail, m.portNames...)
+		start := min(m.portPage*3, max(0, len(detail)-1))
+		for _, line := range detail[start:min(len(detail), start+3)] {
+			lines = append(lines, "  "+line)
+		}
+		footer = []string{"Enter / Ctrl+S 変更を保存  PgUp/PgDn 設定名", "Esc 変更せず一覧へ  Ctrl+C 全接続停止"}
 	case "form":
 		title = "接続設定を保存"
 		badge = paint("✎ 入力", tuiAccent, v.color)
@@ -1073,7 +1440,7 @@ func (m *connectUI) View() string {
 		if m.message == "" {
 			lines = append(lines, "", fmt.Sprintf("設定 %s / 127.0.0.1:%d", m.editProfile.Name, m.editProfile.Port))
 		}
-		footer = []string{"↑↓ / Tab 選択  Enter 次へ", "Esc 接続詳細へ  Ctrl+C この画面の全接続停止"}
+		footer = []string{"↑↓ / Tab 選択  Enter 次へ", "Esc 一覧へ戻る  Ctrl+C この画面の全接続停止"}
 	case "export":
 		title = "接続情報を出力"
 		badge = paint("↓ "+m.exportFormat, tuiAccent, v.color)
@@ -1154,7 +1521,7 @@ func (m *connectUI) View() string {
 		title = "接続エラーと対処"
 		footer[0] = fmt.Sprintf("PgUp/PgDn 案内 %d/%d  L 詳細  R 再試行", pageIndex+1, pages)
 	}
-	if m.message != "" && m.state != "export" && !recoveryVisible {
+	if m.message != "" && m.state != "export" && m.state != "portForm" && !recoveryVisible {
 		lines = append(lines, "", ansi.Wrap(safeLog(m.message), width-4, ""))
 	}
 	if current.ConnectionName != "" && m.state != "form" && m.state != "export" && m.state != "exportTools" && m.state != "error" {

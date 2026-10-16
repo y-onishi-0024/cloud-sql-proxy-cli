@@ -20,6 +20,8 @@ type terminalChoice struct {
 	compact             []string
 }
 type choiceView struct {
+	sideTitle                  string
+	sideLines                  []string
 	title, tabs, query, notice string
 	pos, cursor                int
 	rows                       []terminalChoice
@@ -98,6 +100,8 @@ func (v terminalView) choices(c choiceView) string {
 	}
 	if wide {
 		reserve = 0
+	} else if len(c.sideLines) > 0 {
+		reserve = min(6, max(2, bodyHeight-7))
 	}
 	limit := max(1, (bodyHeight-2-len(lines)-reserve)/2)
 	start := max(0, c.cursor-limit+1)
@@ -124,7 +128,7 @@ func (v terminalView) choices(c choiceView) string {
 	if c.cursor >= 0 && c.cursor < len(c.rows) {
 		row := c.rows[c.cursor]
 		detail = row.details
-		if !wide {
+		if !wide && len(c.sideLines) == 0 {
 			compact := row.compact
 			if len(compact) == 0 {
 				compact = []string{"選択中  " + row.summary, "  " + row.hint}
@@ -137,11 +141,27 @@ func (v terminalView) choices(c choiceView) string {
 			}
 		}
 	}
+	if c.sideLines != nil {
+		if wide {
+			detail = c.sideLines
+		} else {
+			count := min(len(c.sideLines), max(1, reserve-1))
+			for len(lines) < bodyHeight-2-count-1 {
+				lines = append(lines, "")
+			}
+			lines = append(lines, "── "+c.sideTitle+" ──")
+			lines = append(lines, c.sideLines[:count]...)
+		}
+	}
 	body := v.panel(c.title, lines, leftWidth, bodyHeight)
 	if wide {
 		rightWidth := v.width - leftWidth - 1
 		left := strings.Split(body, "\n")
-		right := strings.Split(v.panel("接続先の詳細", detail, rightWidth, bodyHeight), "\n")
+		title := "接続先の詳細"
+		if c.sideTitle != "" {
+			title = c.sideTitle
+		}
+		right := strings.Split(v.panel(title, detail, rightWidth, bodyHeight), "\n")
 		for i := range left {
 			left[i] += " " + right[i]
 		}

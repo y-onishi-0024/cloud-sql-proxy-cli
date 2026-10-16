@@ -105,6 +105,12 @@ func TestMain(m *testing.M) {
 		if mode == "lateauth" {
 			fmt.Println(`{"severity":"ERROR","message":"failed to connect: invalid_grant invalid_rapt"}`)
 		}
+		// PTYで一覧を残したログのページ送りを確認するためのfixture出力。
+		if mode == "workspace-long" {
+			for i := 0; i < 80; i++ {
+				fmt.Printf("{\"severity\":\"INFO\",\"message\":\"fixture-log-%03d 日本語の接続ログを表示します\"}\n", i)
+			}
+		}
 		ch := make(chan os.Signal, 1)
 		signal.Notify(ch, terminationSignals()...)
 		for {
