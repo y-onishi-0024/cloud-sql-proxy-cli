@@ -17,7 +17,13 @@ type FailureContext struct {
 	PrivateIP                                                           bool
 	GcloudMissing                                                       bool
 }
-type Diagnostic struct{ Summary, Cause, Next, Detail string }
+
+// 復旧コマンドは診断側で組み立て、外部ログから実行文字列を抽出しない。
+type RecoveryCommand struct{ Label, Text string }
+type Diagnostic struct {
+	Summary, Cause, Next, Detail string
+	Commands                     []RecoveryCommand
+}
 type diagnosticError struct {
 	Context FailureContext
 	Err     error
@@ -64,7 +70,7 @@ func explainFailure(fc FailureContext, raw string) Diagnostic {
 	if gcloud == "" {
 		gcloud = "gcloud"
 	}
-	d := Diagnostic{Summary: fc.Operation + "に失敗しました", Cause: "原因を特定できませんでした", Next: "csql doctor と詳細ログを確認してください", Detail: safeLog(raw)}
+	d := Diagnostic{Commands: []RecoveryCommand{{Label: "診断", Text: "csql doctor"}}, Summary: fc.Operation + "に失敗しました", Cause: "原因を特定できませんでした", Next: "csql doctor と詳細ログを確認してください", Detail: safeLog(raw)}
 	contains := func(values ...string) bool {
 		for _, v := range values {
 			if strings.Contains(lower, v) {
@@ -80,6 +86,7 @@ func explainFailure(fc FailureContext, raw string) Diagnostic {
 	case contains("invalid_rapt", "invalid_grant", "reauthentication", "reauth related", "no active account", "not currently have an active account", "please run: $ gcloud auth login", "please run:\n\n  $ gcloud auth login", "could not find default credentials", "default credentials were not found", "credentials are not found", "token has been expired", "token has expired"):
 		if fc.Source == "gcloud" {
 			d.Cause = "検索に使うgcloudの認証が必要です"
+			d.Commands = []RecoveryCommand{{Label: "検索のGoogle認証", Text: gcloud + " auth login"}}
 			d.Next = gcloud + " auth login\n認証後、csql --refresh で一覧を再取得してください"
 		} else if fc.Source == "proxy" {
 			if fc.CredentialMode == "explicit" {
@@ -87,6 +94,7 @@ func explainFailure(fc FailureContext, raw string) Diagnostic {
 				d.Next = "GOOGLE_APPLICATION_CREDENTIALSで指定した認証ファイルの発行元・有効期限・アカウントを確認し、Proxyを再起動してください"
 			} else {
 				d.Cause = "Proxy用のGoogle認証（ADC）が未設定または再認証を必要としています"
+				d.Commands = []RecoveryCommand{{Label: "ProxyのADC認証", Text: gcloud + " auth application-default login"}}
 				d.Next = gcloud + " auth application-default login\n認証後、Proxyを再起動してください。検索用のgcloud auth loginとは別の認証です"
 			}
 		}
@@ -94,6 +102,7 @@ func explainFailure(fc FailureContext, raw string) Diagnostic {
 		d.Cause = "対象へのアクセス権限が不足している可能性があります"
 		d.Next = "対象 " + fc.Project + " / " + fc.Instance + " と、利用中アカウントのCloud SQL Client権限（cloudsql.instances.get / connect）を管理者に確認してください。検索の失敗ではプロジェクト・インスタンスの参照権限も確認してください"
 	case contains("address already in use", "only one usage of each socket", "port", "ポート", "使用中", "予約", "一致しません") && (fc.Source == "local" || contains("address already in use", "only one usage of each socket", "bind:")):
+		d.Commands = []RecoveryCommand{{Label: "接続状態", Text: "csql status"}, {Label: "保存設定", Text: "csql profile list"}}
 		d.Cause = "ローカルPortまたは保存済み予約と競合しています"
 		d.Next = "csql status と csql profile list を確認してください。保存済みPortは自動変更しません"
 	case contains("no such host", "network is unreachable", "i/o timeout", "timed out", "deadline exceeded", "connection refused", "connection reset", "tls handshake timeout", "時間切れ"):
@@ -104,12 +113,14 @@ func explainFailure(fc FailureContext, raw string) Diagnostic {
 		}
 	case contains("csql setup", "未導入", "proxy v2", "非対応"):
 		d.Cause = "必要なコマンドが不足しているか非対応です"
+		d.Commands = []RecoveryCommand{{Label: "診断", Text: "csql doctor"}, {Label: "不足ツールの導入", Text: "csql setup --install"}}
 		d.Next = "csql doctor\ncsql setup --install"
 	case contains("profiles.json", "保存", "リンク", "permission denied") && fc.Source == "local":
 		d.Cause = "ローカル設定を読み書きできません"
 		d.Next = "詳細に表示されたパスの権限・リンク・JSON形式を確認してください。既存設定を退避してから修復してください"
 	}
 	if fc.GcloudMissing && strings.Contains(d.Next, " auth ") {
+		d.Commands = []RecoveryCommand{{Label: "診断", Text: "csql doctor"}, {Label: "不足ツールの導入", Text: "csql setup --install"}}
 		d.Next = "gcloudが見つかりません。csql doctor / csql setup --install で導入してください。\n導入後: " + d.Next
 	}
 	return d

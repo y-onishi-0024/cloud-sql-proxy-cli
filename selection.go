@@ -23,6 +23,7 @@ type selector struct {
 	cancelled               bool
 	width, height, inputPos int
 	color                   bool
+	theme                   uiTheme
 }
 
 func (s selector) filtered() []Instance {
@@ -88,7 +89,7 @@ func (s selector) View() string {
 	for _, r := range s.filtered() {
 		rows = append(rows, instanceChoice(r))
 	}
-	v := terminalView{width: width, height: height, color: s.color}
+	v := terminalView{width: width, height: height, color: s.color, theme: s.theme}
 	return v.choices(choiceView{title: "インスタンス一覧", tabs: "名前・プロジェクトで検索", query: s.query, pos: s.inputPos, cursor: s.cursor, rows: rows, footer: []string{"↑↓ 選択  Enter 接続  Ctrl+U 検索を消去", "Esc 取消  Ctrl+C 終了"}})
 }
 func instanceChoice(r Instance) terminalChoice {
@@ -96,7 +97,7 @@ func instanceChoice(r Instance) terminalChoice {
 }
 
 func paint(s, color string, enabled bool) string {
-	if !enabled {
+	if !enabled || color == "" {
 		return s
 	}
 	return lipgloss.NewStyle().Foreground(lipgloss.Color(color)).Render(s)
@@ -194,7 +195,11 @@ func (a *App) SelectInstance(ctx context.Context, rows []Instance) (Instance, er
 		a.printInstances(rows)
 		return Instance{}, fmt.Errorf("候補の選択には対話端末が必要です。インスタンス名と --project を指定してください")
 	}
-	m, err := tea.NewProgram(selector{rows: rows}, tea.WithInput(a.In), tea.WithOutput(a.terminalOutput()), tea.WithContext(ctx), tea.WithoutSignalHandler(), tea.WithAltScreen()).Run()
+	theme, err := parseUITheme(a.Env)
+	if err != nil {
+		return Instance{}, err
+	}
+	m, err := tea.NewProgram(selector{rows: rows, theme: theme, color: a.Env("NO_COLOR") == ""}, tea.WithInput(a.In), tea.WithOutput(a.terminalOutput()), tea.WithContext(ctx), tea.WithoutSignalHandler(), tea.WithAltScreen()).Run()
 	if ctx.Err() != nil {
 		return Instance{}, ctx.Err()
 	}
@@ -283,6 +288,12 @@ type connectUI struct {
 	exportFormat, exportData             string
 	exportCursor                         int
 	location                             *listLocation
+	actionOrigin                         *actionContext
+	actionQuery                          string
+	actionInputPos                       int
+	help                                 *helpOverlay
+	copyBusy                             bool
+	copyOperation, interaction           uint64
 	actionCursor, portExpected, portPage int
 	portNames                            []string
 	connectionLogs                       bool
@@ -482,64 +493,362 @@ func (m *connectUI) returnToList() {
 	}
 	m.selector.cursor = max(0, min(m.selector.cursor, count-1))
 }
-func (m *connectUI) workspaceActions() []string {
-	if m.tab == tabProfiles {
-		return []string{"ポート変更"}
+
+// 操作の内容と起点を別々に保持し、絞込み後の行番号を命令に使わない。
+type uiAction struct {
+	ID, Label, Keywords, DisabledReason string
+	Command                             RecoveryCommand
+}
+type actionContext struct {
+	state          string
+	location       listLocation
+	profile        Profile
+	owner, attempt uint64
+	generation     int
+	diagnostic     *Diagnostic
+}
+type helpOverlay struct {
+	lines []string
+	page  int
+}
+type uiClipboardResult struct {
+	operation, interaction uint64
+	origin                 actionContext
+	Text                   string
+	err                    error
+}
+
+func (m *connectUI) captureActions() *actionContext {
+	b := &actionContext{state: m.state, generation: m.generation, location: listLocation{tab: m.tab, query: m.selector.query, inputPos: m.selector.inputPos, cursor: m.selector.cursor}}
+	if m.state == "error" {
+		b.diagnostic = m.diagnostic
+	} else if m.tab == tabConnections || m.state == "connecting" {
+		c := m.actionConnection()
+		if m.state == "connecting" {
+			c = m.selectedConnection()
+		}
+		if c == nil {
+			return nil
+		}
+		b.owner, b.attempt, b.profile = c.id, c.attempt, c.effectiveProfile()
+		b.location.connectionID = c.id
+		b.diagnostic = c.diagnostic
+		if b.diagnostic == nil && c.progress != nil {
+			b.diagnostic = c.progress.Snapshot().Diagnostic
+		}
+	} else if p, ok := m.selected(); ok {
+		b.profile = p
 	}
-	return []string{"エクスポート  Ctrl+E", "ログ表示/非表示  Ctrl+L", "保存・別名保存  Ctrl+S", "ポート変更", "停止  Ctrl+D", "再試行  Ctrl+R"}
+	if b.diagnostic != nil {
+		d := *b.diagnostic
+		d.Commands = append([]RecoveryCommand(nil), d.Commands...)
+		b.diagnostic = &d
+	}
+	return b
+}
+func (m *connectUI) availableActions() []uiAction {
+	b := m.actionOrigin
+	if b == nil {
+		return nil
+	}
+	var rows []uiAction
+	add := func(id, label, words, reason string) {
+		rows = append(rows, uiAction{ID: id, Label: label, Keywords: words, DisabledReason: reason})
+	}
+	if b.state == "error" {
+		add("refresh", "一覧を再取得", "refresh retry 再検索", "")
+	} else if b.location.tab == tabConnections {
+		c := m.connection(b.owner)
+		add("export", "エクスポート  Ctrl+E", "export 出力 pgadmin dbeaver a5", "")
+		add("logs", "ログ表示/非表示  Ctrl+L", "logs log", "")
+		add("save", "保存・別名保存  Ctrl+S", "save", "")
+		reason := "先に設定を保存"
+		for _, p := range m.profiles {
+			if p.ConnectionName == b.profile.ConnectionName {
+				reason = ""
+				break
+			}
+		}
+		if c != nil && (c.running || c.stopping) {
+			reason = "停止後に変更"
+		}
+		add("port", "ポート変更", "port", reason)
+		reason = ""
+		if c == nil || !c.running {
+			reason = "停止済み"
+		} else if c.stopping {
+			reason = "停止完了を待機"
+		}
+		add("stop", "停止  Ctrl+D", "stop", reason)
+		reason = ""
+		if c != nil && c.stopping {
+			reason = "停止完了を待機"
+		}
+		add("retry", "再試行  Ctrl+R", "retry restart 再起動", reason)
+		if c != nil {
+			reason = ""
+			if c.stopping {
+				reason = "停止完了を待機"
+			} else if c.running && (c.progress == nil || c.progress.Snapshot().Session.Port == 0) {
+				reason = "Portの確定を待機"
+			}
+			rows[0].DisabledReason = reason
+			rows[2].DisabledReason = reason
+		}
+	} else {
+		reason := ""
+		if b.profile.ConnectionName == "" {
+			reason = "接続先を選択してください"
+		}
+		// profile addは保存専用。共通メニューでも接続を許可しない。
+		if !m.addOnly {
+			add("connect", "接続", "connect", reason)
+		}
+		add("save", "保存・別名保存  Ctrl+S", "save", reason)
+		if b.location.tab == tabProfiles {
+			add("port", "ポート変更", "port", reason)
+		} else {
+			add("refresh", "一覧を再取得", "refresh 再検索", "")
+		}
+	}
+	if b.diagnostic != nil {
+		for _, cmd := range b.diagnostic.Commands {
+			reason := ""
+			if m.copyBusy {
+				reason = "コピー完了を待機"
+			}
+			rows = append(rows, uiAction{ID: "copy-recovery", Label: cmd.Label + "をコピー", Keywords: "copy command コマンド " + cmd.Text, DisabledReason: reason, Command: cmd})
+		}
+	}
+	return rows
+}
+func (m *connectUI) filteredActions() []uiAction {
+	var first, others []uiAction
+	q := strings.ToLower(m.actionQuery)
+	for _, a := range m.availableActions() {
+		if !strings.Contains(strings.ToLower(a.Label+" "+a.Keywords), q) {
+			continue
+		}
+		direct := strings.HasPrefix(strings.ToLower(a.Label), q)
+		for _, word := range strings.Fields(strings.ToLower(a.Keywords)) {
+			if word == q {
+				direct = true
+			}
+		}
+		if direct {
+			first = append(first, a)
+		} else {
+			others = append(others, a)
+		}
+	}
+	return append(first, others...)
 }
 func (m *connectUI) openActions() {
-	if c := m.actionConnection(); c != nil {
-		m.selectedID = c.id
-		m.editProfile = c.effectiveProfile()
-	} else if p, ok := m.selected(); ok && m.tab == tabProfiles {
-		m.editProfile = p
-	} else {
+	b := m.captureActions()
+	if b == nil {
 		m.message = "操作する行を選択してください"
 		return
 	}
-	m.rememberList()
-	m.actionCursor = 0
-	m.state = "actions"
+	m.actionOrigin = b
+	m.editProfile = b.profile
+	m.selectedID = b.owner
+	loc := b.location
+	m.location = &loc
+	m.actionCursor, m.actionInputPos = 0, 0
+	m.actionQuery = ""
 	m.message = ""
+	m.state = "actions"
 }
-func (m *connectUI) workspaceAction(index int) tea.Cmd {
-	c := m.actionConnection()
-	if m.state == "actions" && m.tab == tabConnections {
-		c = m.selectedConnection()
-	}
-	if m.tab == tabProfiles {
-		if index == 3 || m.state == "actions" {
-			m.openPortForm(m.editProfile)
+func (m *connectUI) restoreActionOrigin() {
+	if b := m.actionOrigin; b != nil {
+		loc := b.location
+		m.location = &loc
+		m.returnToList()
+		if b.state == "error" {
+			m.state = "error"
+		} else if b.state == "connecting" {
+			m.state = "connecting"
 		}
+	}
+}
+func sameDiagnostic(a, b *Diagnostic) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	if a.Summary != b.Summary || a.Cause != b.Cause || a.Next != b.Next || a.Detail != b.Detail || len(a.Commands) != len(b.Commands) {
+		return false
+	}
+	for i := range a.Commands {
+		if a.Commands[i] != b.Commands[i] {
+			return false
+		}
+	}
+	return true
+}
+func (m *connectUI) actionValid(b *actionContext, command bool) bool {
+	if b == nil {
+		return false
+	}
+	var d *Diagnostic
+	if b.owner != 0 {
+		c := m.connection(b.owner)
+		if c == nil || c.attempt != b.attempt || c.effectiveProfile() != b.profile {
+			return false
+		}
+		if b.location.tab == tabConnections {
+			present := false
+			for _, row := range m.matchedConnections() {
+				if row.id == b.owner {
+					present = true
+					break
+				}
+			}
+			if !present {
+				return false
+			}
+		}
+		d = c.diagnostic
+		if d == nil && c.progress != nil {
+			d = c.progress.Snapshot().Diagnostic
+		}
+	} else {
+		if m.generation != b.generation {
+			return false
+		}
+		d = m.diagnostic
+	}
+	return !command || sameDiagnostic(d, b.diagnostic)
+}
+func (m *connectUI) executeShortcut(id string) tea.Cmd {
+	if m.state != "actions" {
+		m.actionOrigin = m.captureActions()
+	}
+	for _, a := range m.availableActions() {
+		if a.ID == id {
+			return m.executeAction(a)
+		}
+	}
+	m.message = "操作する行を選択してください"
+	return nil
+}
+func (m *connectUI) executeAction(action uiAction) tea.Cmd {
+	b := m.actionOrigin
+	if !m.actionValid(b, action.ID == "copy-recovery") {
+		m.message = "対象が更新されました。Escで戻り、操作を選び直してください"
 		return nil
 	}
-	if c == nil {
-		m.message = "操作する接続を選択してください"
+	// 背景の停止・進捗更新後の条件で再検査する。
+	found := false
+	for _, current := range m.availableActions() {
+		if current.ID == action.ID && current.Command == action.Command {
+			action = current
+			found = true
+			break
+		}
+	}
+	if !found {
 		return nil
 	}
-	m.selectedID = c.id
-	switch index {
-	case 0:
+	if action.DisabledReason != "" {
+		m.message = action.DisabledReason
+		return nil
+	}
+	m.selectedID = b.owner
+	m.editProfile = b.profile
+	if m.state == "list" {
+		m.rememberList()
+	}
+	switch action.ID {
+	case "connect":
+		m.restoreActionOrigin()
+		m.location = nil
+		return m.startConnection(b.profile)
+	case "refresh":
+		m.restoreActionOrigin()
+		m.location = nil
+		m.tab = tabInstances
+		m.request.Refresh = true
+		return m.search()
+	case "save":
+		m.openForm(b.profile)
+	case "export":
 		m.openExportMenu()
-	case 1:
-		if m.state == "actions" {
-			m.returnToList()
-		}
+	case "port":
+		m.openPortForm(b.profile)
+	case "logs":
+		m.restoreActionOrigin()
 		m.connectionLogs = !m.connectionLogs
-		c.recoveryPage = 0
-	case 2:
-		m.openForm(c.effectiveProfile())
-	case 3:
-		m.openPortForm(c.effectiveProfile())
-	case 4, 5:
-		if m.state == "actions" {
-			m.returnToList()
+		if c := m.connection(b.owner); c != nil {
+			c.recoveryPage = 0
 		}
-		return m.stopConnection(c.id, index == 5)
+	case "stop", "retry":
+		m.restoreActionOrigin()
+		return m.stopConnection(b.owner, action.ID == "retry")
+	case "copy-recovery":
+		m.restoreActionOrigin()
+		m.copyBusy = true
+		m.copyOperation++
+		result := uiClipboardResult{operation: m.copyOperation, interaction: m.interaction, origin: *b, Text: action.Command.Text}
+		a, ctx, text := m.a, m.ctx, action.Command.Text
+		cancelled := result
+		cancelled.err = context.Canceled
+		return m.work(ctx, cancelled, func() tea.Msg { result.err = a.copyText(ctx, text); return result })
 	}
 	return nil
 }
+func (m *connectUI) openHelp() {
+	screen := map[string]string{"list": "一覧", "actions": "操作メニュー", "form": "接続設定の保存", "portForm": "ポート変更", "export": "出力先の入力", "exportTools": "出力ツールの選択", "error": "エラーと対処", "saving": "保存処理中", "searching": "インスタンス検索", "stopping": "終了処理中", "connecting": "接続情報"}[m.state]
+	lines := []string{"現在の画面: " + screen}
+	switch m.state {
+	case "actions":
+		lines = append(lines, "文字入力 操作を検索 / Ctrl+U 消去", "↑↓ / Tab 選択  Enter 実行  Esc 元の一覧")
+	case "form":
+		lines = append(lines, "入力: 左右/Home/End 編集、Ctrl+U 消去", "Tab / ↑↓ 項目移動  Enter 次へ/保存  Ctrl+S 保存", "Esc 入力を取り消して戻る")
+	case "portForm":
+		lines = append(lines, "左右/Home/End 編集、Ctrl+U 消去", "Enter / Ctrl+S 保存  PgUp/PgDn 対象設定", "Esc 変更せず戻る")
+	case "export":
+		lines = append(lines, "左右/Home/End 編集、Ctrl+U 消去", "Enter 出力  Esc ツール選択")
+	case "exportTools":
+		lines = append(lines, "↑↓ / Tab ツール選択  Enter 出力先へ", "Esc 元の一覧へ")
+	case "error":
+		lines = append(lines, "Ctrl+K 復旧操作を検索", "Ctrl+R / R 一覧を再取得  Ctrl+L 詳細", "PgUp/PgDn 対処案内  Tab 保存済み設定")
+	case "saving":
+		lines = append(lines, "保存完了まで待機中。入力は変更できません")
+	default:
+		lines = append(lines, "文字入力 接続先を検索 / Ctrl+U 消去", "↑↓ / Ctrl+P・N 選択  Tab 一覧切替", "Ctrl+K 操作を検索")
+		if m.tab == tabConnections {
+			lines = append(lines, "Enter / Ctrl+O 操作メニュー", "Ctrl+E 出力  Ctrl+L ログ  Ctrl+S 保存", "Ctrl+D 個別停止  Ctrl+R 再試行", "PgUp/PgDn ログ・対処案内")
+		} else {
+			lines = append(lines, "Enter 接続  Ctrl+S 保存", "Ctrl+O 保存済み設定の操作")
+		}
+	}
+	lines = append(lines, "F1/Esc ヘルプを閉じる", "Ctrl+C この画面の全接続停止", "コピー後は別ターミナルで実行し、戻って再試行", "DBログイン未検証")
+	var p Profile
+	var session string
+	if m.state == "actions" && m.actionOrigin != nil {
+		p = m.actionOrigin.profile
+	} else if m.state == "form" || m.state == "portForm" || m.state == "export" || m.state == "exportTools" {
+		p = m.editProfile
+	} else if c := m.actionConnection(); c != nil {
+		p = c.effectiveProfile()
+		if c.progress != nil {
+			session = c.progress.Snapshot().Session.ID
+		}
+	} else if row, ok := m.selected(); ok {
+		p = row
+	}
+	if p.ConnectionName != "" {
+		lines = append(lines, "", "選択対象", p.Project+" / "+p.Instance.Name, fmt.Sprintf("Host 127.0.0.1:%d", p.Port), "DB "+p.Database+" / "+p.Username)
+	}
+	if session != "" {
+		lines = append(lines, "セッション "+session)
+	}
+	if m.updateVersion != "" {
+		lines = append(lines, "", "更新 "+m.updateVersion, updatePage)
+	}
+	m.help = &helpOverlay{lines: lines}
+}
+
 func (m *connectUI) openPortForm(p Profile) {
 	if m.state == "list" {
 		m.rememberList()
@@ -628,16 +937,26 @@ func (m *connectUI) workspacePanel(width, height int) (string, []string, int) {
 	}
 	if c != nil {
 		p := c.effectiveProfile()
-		lines = append(lines, c.status(), fmt.Sprintf("Host 127.0.0.1:%d", p.Port), "DB "+p.Database+" / "+p.Username)
-		lines = append(lines, p.Region+" / "+p.DatabaseVersion)
-		if c.progress != nil {
-			if id := c.progress.Snapshot().Session.ID; id != "" {
-				lines = append(lines, "セッション "+id)
-			}
-		}
 		if c.diagnostic != nil {
-			lines = append(lines, strings.Split(ansi.Wrap(safeLog(c.diagnostic.Cause+"\n次の操作: "+c.diagnostic.Next), wrapWidth, ""), "\n")...)
+			d := c.diagnostic
+			recovery := d.Cause + "\n次の操作:\n" + d.Next + "\nCtrl+Kで復旧コマンドをコピー / Ctrl+Rで再試行"
+			if d.Summary != "" {
+				recovery = d.Summary + "\n" + recovery
+			}
+			lines = append(lines, strings.Split(ansi.Wrap(safeLog(recovery), wrapWidth, ""), "\n")...)
 		}
+		database, user := p.Database, p.Username
+		if database == "" {
+			database = "未指定"
+		}
+		if user == "" {
+			user = "未指定"
+		}
+		port := strconv.Itoa(p.Port)
+		if p.Port == 0 {
+			port = "未確定"
+		}
+		lines = append(lines, c.status(), "Host 127.0.0.1:"+port, p.Instance.Name, "DB "+database+" / "+user, p.Region+" / "+p.DatabaseVersion, "DBログイン未検証")
 		if m.connectionLogs {
 			title = "ログ · PgUp/PgDn"
 			var logs []string
@@ -872,6 +1191,32 @@ func (m *connectUI) beginExport(format string) {
 }
 func (m *connectUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch v := msg.(type) {
+	case uiClipboardResult:
+		if v.operation != m.copyOperation {
+			return m, nil
+		}
+		m.copyBusy = false
+		b := &v.origin
+		if m.exit || m.interaction != v.interaction || m.state != b.state || m.tab != b.location.tab || !m.actionValid(b, true) {
+			return m, nil
+		}
+		if b.owner != 0 {
+			c := m.actionConnection()
+			if c == nil || c.id != b.owner {
+				return m, nil
+			}
+		}
+		if v.err != nil {
+			m.message = "コピーできませんでした。手動コピーしてください:\n" + v.Text + "\n" + safeLog(v.err.Error())
+		} else {
+			m.message = "コピーしました。別ターミナルで実行→戻って再試行\n" + v.Text
+		}
+		if c := m.connection(b.owner); c != nil {
+			c.recoveryPage = 0
+		} else {
+			m.recoveryPage = 0
+		}
+		return m, nil
 	case uiShutdownComplete:
 		return m, tea.Quit
 	case updateChecked:
@@ -1039,6 +1384,28 @@ func (m *connectUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if key == "ctrl+c" {
 			return m, m.beginShutdown()
 		}
+		if !m.exit && key == "f1" {
+			if m.help == nil {
+				m.openHelp()
+			} else {
+				m.help = nil
+			}
+			return m, nil
+		}
+		if m.help != nil && !m.exit {
+			switch key {
+			case "esc":
+				m.help = nil
+			case "pgup", "up":
+				m.help.page = max(0, m.help.page-1)
+			case "pgdown", "down":
+				m.help.page++
+			}
+			return m, nil
+		}
+		if key != "pgup" && key != "pgdown" {
+			m.interaction++
+		}
 		if m.exit || m.state == "saving" || m.state == "stopping" {
 			return m, nil
 		}
@@ -1057,21 +1424,27 @@ func (m *connectUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if m.state == "actions" {
-			if m.tab == tabConnections {
-				indices := map[string]int{"ctrl+e": 0, "ctrl+l": 1, "ctrl+s": 2, "ctrl+d": 4, "ctrl+r": 5}
-				if index, ok := indices[key]; ok {
-					return m, m.workspaceAction(index)
-				}
+			ids := map[string]string{"ctrl+e": "export", "ctrl+l": "logs", "ctrl+s": "save", "ctrl+d": "stop", "ctrl+r": "retry"}
+			if id := ids[key]; id != "" {
+				return m, m.executeShortcut(id)
 			}
+			rows := m.filteredActions()
 			switch key {
 			case "esc":
-				m.returnToList()
-			case "up", "shift+tab":
+				m.restoreActionOrigin()
+			case "up", "shift+tab", "ctrl+p":
 				m.actionCursor = max(0, m.actionCursor-1)
-			case "down", "tab":
-				m.actionCursor = min(len(m.workspaceActions())-1, m.actionCursor+1)
+			case "down", "tab", "ctrl+n":
+				m.actionCursor = min(max(0, len(rows)-1), m.actionCursor+1)
 			case "enter":
-				return m, m.workspaceAction(m.actionCursor)
+				if m.actionCursor < len(rows) {
+					return m, m.executeAction(rows[m.actionCursor])
+				}
+			default:
+				if editText(&m.actionQuery, &m.actionInputPos, v) {
+					m.actionCursor = 0
+					m.message = ""
+				}
 			}
 			return m, nil
 		}
@@ -1218,15 +1591,28 @@ func (m *connectUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.state == "searching" {
 			return m, nil
 		}
+		if m.state == "error" && key == "ctrl+l" {
+			m.showLogs = !m.showLogs
+			m.recoveryPage = 0
+			return m, nil
+		}
+		if m.state == "error" && key == "ctrl+r" {
+			m.actionOrigin = m.captureActions()
+			return m, m.executeShortcut("refresh")
+		}
+		if (m.state == "list" || m.state == "error") && key == "ctrl+k" {
+			m.openActions()
+			return m, nil
+		}
 		if m.state == "list" && (m.tab == tabConnections || m.tab == tabProfiles) {
 			if key == "ctrl+o" {
 				m.openActions()
 				return m, nil
 			}
 			if m.tab == tabConnections {
-				indices := map[string]int{"ctrl+e": 0, "ctrl+l": 1, "ctrl+s": 2, "ctrl+d": 4, "ctrl+r": 5}
+				indices := map[string]string{"ctrl+e": "export", "ctrl+l": "logs", "ctrl+s": "save", "ctrl+d": "stop", "ctrl+r": "retry"}
 				if index, ok := indices[key]; ok {
-					return m, m.workspaceAction(index)
+					return m, m.executeShortcut(index)
 				}
 				if key == "pgup" || key == "pgdown" {
 					if c := m.actionConnection(); c != nil {
@@ -1340,8 +1726,19 @@ func (m *connectUI) View() string {
 	if width < 60 || height < 16 {
 		return fitScreen("60列×16行以上に広げてください。\nCtrl+C: この画面の全接続停止", width, height)
 	}
-	v := terminalView{width: width, height: height, color: m.selector.color, update: m.updateVersion}
-	tabs := "Cloud SQL 接続ワークスペース"
+	v := terminalView{width: width, height: height, color: m.selector.color, update: m.updateVersion, theme: m.selector.theme}
+	tabs := m.tabsView()
+	if m.help != nil {
+		var rows []string
+		for _, line := range m.help.lines {
+			rows = append(rows, strings.Split(ansi.Wrap(safeLog(line), max(1, width-4), ""), "\n")...)
+		}
+		pageHeight := max(1, height-6)
+		last := max(0, (len(rows)-1)/pageHeight)
+		page := min(m.help.page, last)
+		start := page * pageHeight
+		return v.frame("操作ヘルプ", tabs, "ヘルプ", v.panel("操作ヘルプ", rows[start:min(len(rows), start+pageHeight)], width, height-4), []string{fmt.Sprintf("PgUp/PgDn %d/%d  F1/Esc 閉じる", page+1, last+1), "Ctrl+C 全接続停止"})
+	}
 	footer := []string{"↑↓ 選択  Enter 接続  Tab 切替  Ctrl+S 保存", "Ctrl+U 消去  Ctrl+L 注意  Esc 戻る  Ctrl+C 全接続停止"}
 	if m.state == "list" {
 		tabs = m.tabsView()
@@ -1362,13 +1759,37 @@ func (m *connectUI) View() string {
 			}
 			c.title = fmt.Sprintf("接続一覧（稼働 %d件 / 全%d件）", active, len(m.connections))
 			c.footer = []string{"↑↓ 選択  Enter 詳細  Ctrl+D 個別停止  Tab 切替", "Ctrl+U 消去  Esc 戻る  Ctrl+C この画面の全接続停止"}
+			c.table = true
 			for _, conn := range m.matchedConnections() {
 				p := conn.effectiveProfile()
+				name := p.Name
+				if name == "" {
+					name = p.Instance.Name
+				}
+				port := strconv.Itoa(p.Port)
+				if p.Port == 0 {
+					port = "未確定"
+				}
+				database := p.Database
+				if database == "" {
+					database = "未指定"
+				}
+				state := map[string]string{"Proxy利用可能": "● 利用可", "接続確認中": "◌ 確認中", "起動中": "◌ 起動中", "エラー": "! 失敗", "停止中": "◌ 停止中", "停止済み": "○ 停止済"}[conn.status()]
+				role := v.theme.muted
+				switch conn.status() {
+				case "Proxy利用可能":
+					role = v.theme.success
+				case "エラー":
+					role = v.theme.failure
+				case "起動中", "接続確認中", "停止中":
+					role = v.theme.warning
+				}
 				row := instanceChoice(p.Instance)
-				row.name = p.Instance.Name + " · " + conn.status()
-				row.hint = fmt.Sprintf("%s / 127.0.0.1:%d", p.Project, p.Port)
-				row.compact = []string{"状態  " + conn.status(), "DB " + p.Database + " / " + p.Username, fmt.Sprintf("Host 127.0.0.1:%d", p.Port)}
-				row.details = append(row.details, "", conn.status(), fmt.Sprintf("Host 127.0.0.1:%d", p.Port), "DB "+p.Database, "ユーザー "+p.Username)
+				row.name = name + " · " + conn.status()
+				row.hint = p.Project + " / 127.0.0.1:" + port
+				row.columns = []string{state, name, p.Project, port, database}
+				row.statusColor = role
+				row.compact = []string{conn.status(), "DB " + database, "Host 127.0.0.1:" + port}
 				c.rows = append(c.rows, row)
 			}
 		} else if m.tab == tabProfiles {
@@ -1399,27 +1820,37 @@ func (m *connectUI) View() string {
 		}
 		return v.choices(c)
 	}
-	title, badge := "接続ステータス", paint("● 処理中", tuiAccent, v.color)
+	title, badge := "接続ステータス", paint("● 処理中", v.theme.accent, v.color)
 	footer = []string{"L ログ  E エクスポート  Ctrl+S 保存  R 再試行", "N 追加  S 停止  Esc 接続一覧  Ctrl+C 全接続停止"}
 	var lines []string
 	spin := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}[m.frame%10]
 	switch m.state {
 	case "searching":
 		title = "インスタンスを検索"
-		badge = paint(spin+" 検索中", tuiAccent, v.color)
+		badge = paint(spin+" 検索中", v.theme.accent, v.color)
 		lines = []string{"", spin + " アクセスできるCloud SQLを取得しています", "", "プロジェクトの数に応じて時間がかかる場合があります"}
 		footer = []string{"Tab 保存済み設定・接続一覧へ切替", "Esc 戻る  Ctrl+C この画面の全接続停止"}
 	case "actions":
-		title = "選択行の操作"
-		lines = []string{m.editProfile.Project + " / " + m.editProfile.Instance.Name, ""}
-		for i, label := range m.workspaceActions() {
-			marker := "  "
-			if i == m.actionCursor {
-				marker = "› "
+		title = "操作を検索"
+		lines = []string{"検索  " + inputView(m.actionQuery, m.actionInputPos, width-14), ""}
+		rows := m.filteredActions()
+		limit := max(1, height-11)
+		start := max(0, m.actionCursor-limit+1)
+		for i := start; i < len(rows) && i < start+limit; i++ {
+			label := "  " + rows[i].Label
+			if rows[i].DisabledReason != "" {
+				label += " — " + rows[i].DisabledReason
 			}
-			lines = append(lines, marker+label)
+			if i == m.actionCursor {
+				label = v.selected(paddedLine("› "+strings.TrimPrefix(label, "  "), width-4))
+			}
+
+			lines = append(lines, label)
 		}
-		footer = []string{"↑↓ / Tab 選択  Enter 実行", "Esc 一覧へ戻る  Ctrl+C 全接続停止"}
+		if len(rows) == 0 {
+			lines = append(lines, "一致する操作はありません。Ctrl+Uで消去")
+		}
+		footer = []string{"↑↓ / Tab 選択  Enter 実行  Ctrl+U 消去", "Esc 戻る  Ctrl+C 全接続停止"}
 	case "portForm":
 		title = "保存済みPortを変更"
 		lines = []string{m.editProfile.Project + " / " + m.editProfile.Instance.Name, fmt.Sprintf("現在 %d → %s", m.portExpected, m.fields[0].value), "変更先Port  " + inputView(m.fields[0].value, m.fields[0].pos, width-22), "対象設定・案内（PgUp/PgDn）:"}
@@ -1435,7 +1866,7 @@ func (m *connectUI) View() string {
 		footer = []string{"Enter / Ctrl+S 変更を保存  PgUp/PgDn 設定名", "Esc 変更せず一覧へ  Ctrl+C 全接続停止"}
 	case "form":
 		title = "接続設定を保存"
-		badge = paint("✎ 入力", tuiAccent, v.color)
+		badge = paint("✎ 入力", v.theme.accent, v.color)
 		lines = []string{"パスワードはDBツールで管理します", ""}
 		for i, f := range m.fields {
 			marker, text := "  ", f.value
@@ -1448,12 +1879,12 @@ func (m *connectUI) View() string {
 		footer = []string{"Tab / ↑↓ 項目移動  Enter 次へ/保存  Ctrl+S 保存", "Esc 戻る  Ctrl+C この画面の全接続停止"}
 	case "exportTools":
 		title = "エクスポート先ツール"
-		badge = paint("↓ 選択", tuiAccent, v.color)
+		badge = paint("↓ 選択", v.theme.accent, v.color)
 		lines = []string{"出力形式を選んでください", ""}
 		for i, tool := range exportTools {
 			label := "  " + tool.label + "  (" + tool.suffix + ")"
 			if i == m.exportCursor {
-				label = paint("› "+tool.label+"  ("+tool.suffix+")", tuiAccent, v.color)
+				label = paint("› "+tool.label+"  ("+tool.suffix+")", v.theme.accent, v.color)
 			}
 			lines = append(lines, label)
 		}
@@ -1463,7 +1894,7 @@ func (m *connectUI) View() string {
 		footer = []string{"↑↓ / Tab 選択  Enter 次へ", "Esc 一覧へ戻る  Ctrl+C この画面の全接続停止"}
 	case "export":
 		title = "接続情報を出力"
-		badge = paint("↓ "+m.exportFormat, tuiAccent, v.color)
+		badge = paint("↓ "+m.exportFormat, v.theme.accent, v.color)
 		// 出力先と操作を先に置き、長いJSONでも入力欄を隠さない。
 		lines = []string{m.fields[0].label, inputView(m.fields[0].value, m.fields[0].pos, width-6), ""}
 		if m.message != "" {
@@ -1484,28 +1915,28 @@ func (m *connectUI) View() string {
 		lines = []string{"", "保存中… 完了までお待ちください"}
 		footer = []string{"保存処理を実行しています", "Ctrl+C 取消して終了"}
 	case "stopping":
-		badge = paint(spin+" 停止中", tuiAccent, v.color)
+		badge = paint(spin+" 停止中", v.theme.accent, v.color)
 		lines = []string{"", "停止処理中… 所有Proxyと実行中の処理の終了を待っています"}
 		footer = []string{"所有プロセスの終了を待っています", "Ctrl+C 終了"}
 	case "error":
 		footer = []string{"R 再検索  Tab 保存済み設定へ", "Esc 戻る  Ctrl+C この画面の全接続停止"}
-		badge = paint("! 接続エラー", tuiError, v.color)
+		badge = paint("! 接続エラー", v.theme.failure, v.color)
 		lines = []string{"接続できませんでした"}
 	case "stopped":
-		badge = paint("○ 停止済み", tuiMuted, v.color)
+		badge = paint("○ 停止済み", v.theme.muted, v.color)
 		lines = []string{"Proxy停止済み。登録した接続設定は次回も使えます"}
 	default:
 		label := spin + " Proxy起動中…"
 		if c != nil && !c.running {
 			label = "○ 停止済み"
-			badge = paint("○ 停止済み", tuiMuted, v.color)
+			badge = paint("○ 停止済み", v.theme.muted, v.color)
 			if c.err != nil {
-				badge = paint("! 接続エラー", tuiError, v.color)
+				badge = paint("! 接続エラー", v.theme.failure, v.color)
 			}
 		}
 		if c != nil && c.stopping {
 			label = spin + " 停止中"
-			badge = paint("停止中", tuiMuted, v.color)
+			badge = paint("停止中", v.theme.muted, v.color)
 		}
 		if progress != nil {
 			s := progress.Snapshot()
@@ -1518,16 +1949,16 @@ func (m *connectUI) View() string {
 				label = spin + " Cloud SQLへの接続確認中…"
 			case "ready":
 				label = "● Proxy利用可能 / DBログイン未検証"
-				badge = paint("● 接続済み", tuiSuccess, v.color)
+				badge = paint("● 接続済み", v.theme.success, v.color)
 			case "error":
 				label = "! 直近の接続試行でエラー"
-				badge = paint("! 接続エラー", tuiError, v.color)
+				badge = paint("! 接続エラー", v.theme.failure, v.color)
 			}
 			if s.Session.Port > 0 {
 				lines = append(lines, fmt.Sprintf("Host 127.0.0.1  ·  Port %d", s.Session.Port), "セッション "+s.Session.ID, "")
 			}
 		}
-		lines = append(lines, paint(label, tuiAccent, v.color))
+		lines = append(lines, paint(label, v.theme.accent, v.color))
 	}
 	recoveryVisible := diagnostic != nil && (m.state == "error" || m.state == "connecting" || m.state == "stopped")
 	if recoveryVisible {
@@ -1539,13 +1970,13 @@ func (m *connectUI) View() string {
 		start := pageIndex * pageHeight
 		lines = recovery[start:min(len(recovery), start+pageHeight)]
 		title = "接続エラーと対処"
-		footer[0] = fmt.Sprintf("PgUp/PgDn 案内 %d/%d  L 詳細  R 再試行", pageIndex+1, pages)
+		footer[0] = fmt.Sprintf("PgUp/PgDn 案内 %d/%d  Ctrl+K 操作", pageIndex+1, pages)
 	}
 	if m.message != "" && m.state != "export" && m.state != "portForm" && !recoveryVisible {
 		lines = append(lines, "", ansi.Wrap(safeLog(m.message), width-4, ""))
 	}
 	if current.ConnectionName != "" && m.state != "form" && m.state != "export" && m.state != "exportTools" && m.state != "error" {
-		lines = append(lines, "", paint(current.Project+" / "+current.Instance.Name, tuiMuted, v.color), current.Region+" · "+current.DatabaseVersion, "DB "+current.Database+" / ユーザー "+current.Username)
+		lines = append(lines, "", paint(current.Project+" / "+current.Instance.Name, v.theme.muted, v.color), current.Region+" · "+current.DatabaseVersion, "DB "+current.Database+" / ユーザー "+current.Username)
 	}
 	if showLogs && progress != nil && diagnostic == nil {
 		space := height - 7 - len(strings.Split(strings.Join(lines, "\n"), "\n"))
@@ -1558,7 +1989,7 @@ func (m *connectUI) View() string {
 			lines = append(lines, logs...)
 		}
 	}
-	return v.frame("CLOUD SQL", tabs, badge, v.panel(title, strings.Split(strings.Join(lines, "\n"), "\n"), width, height-4), footer)
+	return v.frame(title, tabs, badge, v.panel(title, strings.Split(strings.Join(lines, "\n"), "\n"), width, height-4), footer)
 }
 
 func (m *connectUI) dimensions() (int, int) {
@@ -1603,6 +2034,9 @@ func (m *connectUI) recoveryLines(width int) []string {
 		return nil
 	}
 	text := d.Cause + "\n\n次の操作:\n" + d.Next
+	if d.Summary != "" {
+		text = d.Summary + "\n" + text
+	}
 	if m.message != "" {
 		text += "\n\n" + m.message
 	}
@@ -1615,13 +2049,17 @@ func (m *connectUI) recoveryLines(width int) []string {
 	return strings.Split(ansi.Wrap(safeLog(text), max(1, width-4), ""), "\n")
 }
 func (a *App) runConnectModel(ctx context.Context, request connectRequest, seed *Profile) error {
+	theme, err := parseUITheme(a.Env)
+	if err != nil {
+		return err
+	}
 	profiles, err := a.LoadProfiles()
 	if err != nil {
 		return err
 	}
 	uiCtx, cancelAll := context.WithCancel(ctx)
 	defer cancelAll()
-	m := &connectUI{a: a, ctx: uiCtx, cancelAll: cancelAll, request: request, profiles: profiles, state: "list", selector: selector{color: a.Env("NO_COLOR") == ""}}
+	m := &connectUI{a: a, ctx: uiCtx, cancelAll: cancelAll, request: request, profiles: profiles, state: "list", selector: selector{color: a.Env("NO_COLOR") == "", theme: theme}}
 	if len(profiles) > 0 && request.Query == "" && request.Project == "" && !request.Refresh && seed == nil {
 		m.tab = tabProfiles
 	}

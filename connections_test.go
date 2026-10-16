@@ -77,6 +77,14 @@ func (h *connectionsHarness) key(key string) {
 		msg.Type = tea.KeyTab
 	case "down":
 		msg.Type = tea.KeyDown
+	case "f1":
+		msg.Type = tea.KeyF1
+	case "ctrl+k":
+		msg.Type = tea.KeyCtrlK
+	case "up":
+		msg.Type = tea.KeyUp
+	case "pgdown":
+		msg.Type = tea.KeyPgDown
 	case "ctrl+c":
 		msg.Type = tea.KeyCtrlC
 	case "ctrl+s":
@@ -247,7 +255,7 @@ func TestConnectionsWorkspaceSelection(t *testing.T) {
 	h.m.message = ""
 	h.key("ctrl+l")
 	h.update(tea.WindowSizeMsg{Width: 60, Height: 16})
-	if body := h.m.View(); !strings.Contains(body, "db · 停止済み") || !strings.Contains(body, "log-099") || !strings.Contains(body, "Ctrl+C") {
+	if body := h.m.View(); !strings.Contains(body, "first · 停止済み") || !strings.Contains(body, "log-099") || !strings.Contains(body, "Ctrl+C") {
 		t.Fatalf("狭幅で一覧・ログ・終了案内を喪失: %s", body)
 	}
 	h.update(tea.KeyMsg{Type: tea.KeyPgUp})
@@ -273,6 +281,7 @@ func TestConnectionsPortUpdateBeforeFinish(t *testing.T) {
 	h.m.connections = []*uiConnection{{id: 1, attempt: 1, profile: p, running: true, progress: &connectionProgress{snapshot: connectionSnapshot{Session: SessionStatus{Port: p.Port}}}}}
 	h.m.selectedID = 1
 	h.key("ctrl+o")
+	h.key("ポート")
 	h.key("enter")
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -748,4 +757,323 @@ func TestConnectionsReusesStoppedConnection(t *testing.T) {
 	}
 	rows := awaitSessions(t, a, 1)
 	awaitProxyPort(t, rows[0].Port)
+}
+
+// ヘルプは実際のキー配送で読み、表示状態を閉じてから元の操作を続ける。
+func readUIHelp(m *connectUI) string {
+	m.Update(tea.KeyMsg{Type: tea.KeyF1})
+	var all, body strings.Builder
+	for i := 0; i < 30; i++ {
+		all.WriteString(m.View())
+		for _, line := range strings.Split(m.View(), "\n") {
+			if strings.HasPrefix(line, "│") {
+				body.WriteString(strings.Trim(line, "│ "))
+			}
+		}
+		all.WriteByte('\n')
+		m.Update(tea.KeyMsg{Type: tea.KeyPgDown})
+	}
+	m.Update(tea.KeyMsg{Type: tea.KeyF1})
+	return all.String() + body.String()
+}
+
+// 保存専用コマンドの操作メニューから、意図せずProxyを開始しない。
+func TestProfileAddActionMenuRemainsSaveOnly(t *testing.T) {
+	for _, tab := range []connectionTab{tabInstances, tabProfiles} {
+		t.Run(fmt.Sprint(tab), func(t *testing.T) {
+			a, _, _ := testApp(t)
+			h := newConnectionsHarness(t, a)
+			h.m.addOnly = true
+			h.m.tab = tab
+			h.m.profiles = []Profile{{Name: "existing", Instance: testInstance(), Port: 55441}}
+			key := "ctrl+k"
+			if tab == tabProfiles {
+				key = "ctrl+o"
+			}
+			h.key(key)
+			h.key("connect")
+			h.key("enter")
+			if len(h.m.connections) != 0 || h.m.state != "actions" {
+				t.Fatal("保存専用画面から接続を開始した")
+			}
+			h.update(tea.KeyMsg{Type: tea.KeyCtrlU})
+			h.key("save")
+			h.key("enter")
+			if h.m.state != "form" {
+				t.Fatal("保存専用画面から設定保存へ進めない")
+			}
+		})
+	}
+}
+
+func TestConnectionsDashboardContract(t *testing.T) {
+	a, _, _ := testApp(t)
+	h := newConnectionsHarness(t, a)
+	first := Profile{Name: "開発", Instance: testInstance(), Database: "orders", Username: "reader", Port: 55441}
+	second := first
+	second.Name = "検証"
+	second.Database = "reports"
+	second.Port = 55442
+	second.Instance.Name = "reporting"
+	second.ConnectionName = "alpha:asia-northeast1:reporting"
+	h.m.connections = []*uiConnection{{id: 1, attempt: 1, profile: first}, {id: 2, attempt: 1, profile: second}}
+	h.m.tab = tabConnections
+	h.m.selectedID = 1
+	h.m.updateVersion = "v0.11.0"
+	for _, size := range [][2]int{{120, 26}, {100, 20}, {60, 16}} {
+		h.update(tea.WindowSizeMsg{Width: size[0], Height: size[1]})
+		view := h.m.View()
+		for _, word := range []string{"v0.11.0", "保存済み設定", "接続一覧", "Ctrl+C", "F1"} {
+			if !strings.Contains(view, word) {
+				t.Fatalf("%vで欠落 %s: %s", size, word, view)
+			}
+		}
+		if size[0] >= 100 {
+			for _, word := range []string{"状態", "プロジェクト", "Port", "DB"} {
+				if !strings.Contains(view, word) {
+					t.Fatalf("表に列がない %s", word)
+				}
+			}
+			for _, pair := range []struct{ name, port, db string }{{"開発", "55441", "orders"}, {"検証", "55442", "reports"}} {
+				found := false
+				for _, line := range strings.Split(view, "\n") {
+					if strings.Contains(line, pair.name) && strings.Contains(line, pair.port) && strings.Contains(line, pair.db) {
+						found = true
+					}
+				}
+				if !found {
+					t.Fatalf("列と対象が対応しない: %+v\n%s", pair, view)
+				}
+			}
+		}
+	}
+	h.key("検証")
+	h.key("ctrl+k")
+	if h.m.state != "actions" {
+		t.Fatal("Ctrl+Kで操作メニューが開かない")
+	}
+	h.key("ポート")
+	if !strings.Contains(h.m.View(), "先に設定を保存") {
+		t.Fatal("無効理由がない")
+	}
+	h.key("enter")
+	if h.m.state != "actions" {
+		t.Fatal("無効操作を実行")
+	}
+	h.update(tea.KeyMsg{Type: tea.KeyCtrlU})
+	h.key("export")
+	h.key("enter")
+	if h.m.state != "exportTools" {
+		t.Fatal("検索後に別の操作を実行")
+	}
+	h.key("esc")
+	if h.m.selector.query != "検証" {
+		t.Fatal("操作検索が接続検索を上書き")
+	}
+	h.key("ctrl+k")
+	h.key("none-found")
+	h.key("enter")
+	if h.m.state != "actions" {
+		t.Fatal("検索0件で操作")
+	}
+	h.key("esc")
+	// メニュー開始後の再試行は古い対象から操作しない。
+	h.key("ctrl+k")
+	h.key("save")
+	h.m.connections[1].attempt++
+	h.key("enter")
+	if h.m.state == "form" {
+		t.Fatal("古い試行を保存")
+	}
+	h.key("esc")
+	h.update(tea.KeyMsg{Type: tea.KeyCtrlU})
+	live := h.m.connections[1]
+	live.running = true
+	live.progress = &connectionProgress{snapshot: connectionSnapshot{State: "ready", Session: SessionStatus{Port: live.profile.Port}}}
+	h.key("Proxy利用可能")
+	h.key("ctrl+k")
+	h.key("logs")
+	live.progress.state("error")
+	h.key("enter")
+	if h.m.state != "actions" {
+		t.Fatal("状態検索から消えた対象で別の行のログを開いた")
+	}
+}
+func TestConnectionsHelpAndBackgroundResults(t *testing.T) {
+	a, _, _ := testApp(t)
+	h := newConnectionsHarness(t, a)
+	p := Profile{Name: "dev", Instance: testInstance(), Database: "app", Port: 55441}
+	h.m.connections = []*uiConnection{{id: 1, attempt: 1, profile: p, running: true, progress: &connectionProgress{snapshot: connectionSnapshot{State: "ready", Session: SessionStatus{Port: p.Port}}}}}
+	h.m.tab = tabConnections
+	h.m.selectedID = 1
+	h.key("ctrl+s")
+	h.key("日本語")
+	fields := h.m.fields[0].value
+	h.key("f1")
+	if !strings.Contains(h.m.View(), "操作ヘルプ") {
+		t.Fatal("フォームでF1が開かない")
+	}
+	h.key("unwanted")
+	h.update(connectionFinished{id: 1, attempt: 1, err: fmt.Errorf("background")})
+	if !strings.Contains(h.m.View(), "操作ヘルプ") {
+		t.Fatal("背景終了がヘルプを閉じた")
+	}
+	h.key("esc")
+	if h.m.state != "form" || h.m.fields[0].value != fields {
+		t.Fatal("ヘルプが入力を変更")
+	}
+	h.key("esc")
+	h.key("ctrl+k")
+	h.key("logs")
+	h.key("f1")
+	h.key("esc")
+	h.key("enter")
+	if !strings.Contains(h.m.View(), "ログ") {
+		t.Fatal("ヘルプから戻るとメニュー検索を喪失")
+	}
+	// 保存完了が背後へ配送されてもヘルプを維持し、閉じた後にsavingへ戻さない。
+	h.m.state = "saving"
+	h.m.operation = 9
+	h.m.editOwner = 1
+	h.m.editAttempt = 1
+	h.key("f1")
+	h.update(uiResult{kind: "save", operation: 9, owner: 1, attempt: 1, profile: p})
+	if !strings.Contains(h.m.View(), "操作ヘルプ") {
+		t.Fatal("保存完了でヘルプが閉じた")
+	}
+	h.key("f1")
+	if h.m.state == "saving" || !strings.Contains(h.m.View(), "保存しました") {
+		t.Fatal("保存完了が消えた")
+	}
+	h.m.state = "searching"
+	h.m.tab = tabInstances
+	h.m.searching = true
+	h.m.generation = 4
+	h.key("f1")
+	h.update(uiResult{kind: "search", generation: 4, result: DiscoveryResult{Instances: []Instance{testInstance()}}})
+	if !strings.Contains(h.m.View(), "操作ヘルプ") {
+		t.Fatal("検索完了がヘルプを閉じた")
+	}
+	h.key("f1")
+	if h.m.state != "list" || len(h.m.selector.rows) != 1 {
+		t.Fatal("ヘルプから検索結果へ戻れない")
+	}
+	h.key("f1")
+	h.key("ctrl+c")
+	if !h.m.exit {
+		t.Fatal("ヘルプ中に終了できない")
+	}
+}
+func TestConnectionsRecoveryCopy(t *testing.T) {
+	for _, mode := range []string{"success", "fail", "other-row", "other-attempt", "form", "cancel", "repeat"} {
+		t.Run(mode, func(t *testing.T) {
+			a, _, _ := testApp(t)
+			h := newConnectionsHarness(t, a)
+			p := Profile{Name: "dev", Instance: testInstance(), Port: 55441}
+			d := explainFailure(FailureContext{Source: "proxy", Operation: "接続", GcloudCommand: "'/日本語 path/gcloud'"}, "invalid_rapt")
+			h.m.connections = []*uiConnection{{id: 1, attempt: 1, profile: p, err: fmt.Errorf("auth"), diagnostic: &d}, {id: 2, attempt: 1, profile: p}}
+			h.m.tab = tabConnections
+			h.m.selectedID = 1
+			started := make(chan string, 2)
+			gate := make(chan struct{})
+			a.CopyText = func(ctx context.Context, text string) error {
+				started <- text
+				select {
+				case <-gate:
+					if mode == "fail" {
+						return fmt.Errorf("copy failed")
+					}
+					return nil
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			}
+			h.key("ctrl+k")
+			h.key("コピー")
+			h.key("enter")
+			select {
+			case text := <-started:
+				if text != d.Commands[0].Text {
+					t.Fatalf("折返し/別コマンドをコピー: %q", text)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("コピーを開始しない")
+			}
+			if mode == "repeat" {
+				h.key("ctrl+k")
+				h.key("コピー")
+				h.key("enter")
+				select {
+				case <-started:
+					t.Fatal("コピーを二重開始")
+				default:
+				}
+				h.key("esc")
+			}
+			if mode == "other-row" {
+				h.key("down")
+			}
+			if mode == "other-attempt" {
+				h.m.connections[0].attempt++
+			}
+			if mode == "form" {
+				h.key("ctrl+s")
+			}
+			if mode == "cancel" {
+				h.key("ctrl+c")
+			}
+			close(gate)
+			if mode == "cancel" {
+				h.m.workers.Wait()
+				return
+			}
+			h.pumpUntil(func() bool { return !h.m.copyBusy }, "copy result")
+			if mode == "success" && !strings.Contains(h.m.View(), "別ターミナル") {
+				t.Fatal("認証後の復旧案内がない")
+			}
+			if mode == "fail" {
+				var seen strings.Builder
+				for i := 0; i < 20; i++ {
+					seen.WriteString(h.m.View())
+					h.key("pgdown")
+				}
+				if !strings.Contains(seen.String(), "手動") || !strings.Contains(seen.String(), "application-default") {
+					t.Fatal("コピー失敗でコマンドが読めない")
+				}
+			}
+			if (mode == "other-row" || mode == "other-attempt" || mode == "form") && strings.Contains(h.m.message, "コピーしました") {
+				t.Fatal("遅いコピー結果が別対象を上書き")
+			}
+			if mode == "form" && h.m.state != "form" {
+				t.Fatal("コピー結果がフォームを閉じた")
+			}
+		})
+	}
+}
+
+// 検索認証の復旧をProxyのADC認証と取り違えず、認証自体は起動しない。
+func TestConnectionsSearchRecoveryCopy(t *testing.T) {
+	a, _, _ := testApp(t)
+	h := newConnectionsHarness(t, a)
+	d := explainFailure(FailureContext{Source: "gcloud", Operation: "検索", GcloudCommand: "'/検索 path/gcloud'"}, "invalid_grant")
+	h.m.state = "error"
+	h.m.diagnostic = &d
+	copied := make(chan string, 1)
+	a.CopyText = func(ctx context.Context, text string) error { copied <- text; return nil }
+	a.Runner = runnerFunc(func(context.Context, Executable, []string) ([]byte, error) {
+		t.Error("認証コマンドを自動実行")
+		return nil, fmt.Errorf("禁止")
+	})
+	h.key("ctrl+k")
+	h.key("コピー")
+	h.key("enter")
+	h.pumpUntil(func() bool { return !h.m.copyBusy }, "検索の復旧コピー")
+	select {
+	case text := <-copied:
+		if text != "'/検索 path/gcloud' auth login" {
+			t.Fatalf("検索の認証が異なる: %q", text)
+		}
+	default:
+		t.Fatal("コピーされない")
+	}
 }

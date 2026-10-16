@@ -55,6 +55,19 @@ func TestDiagnosticRecovery(t *testing.T) {
 	} {
 		t.Run(tc.source+tc.raw, func(t *testing.T) {
 			d := explainFailure(FailureContext{Source: tc.source, CredentialMode: tc.mode, GcloudCommand: "'/managed path/gcloud'", PrivateIP: true}, tc.raw)
+			wantCommand := "csql doctor"
+			if tc.source == "proxy" && tc.mode == "user" && strings.Contains(tc.raw, "invalid_grant") {
+				wantCommand = "'/managed path/gcloud' auth application-default login"
+			}
+			if tc.source == "gcloud" && strings.Contains(tc.raw, "invalid_grant") {
+				wantCommand = "'/managed path/gcloud' auth login"
+			}
+			if strings.Contains(tc.raw, "address already in use") {
+				wantCommand = "csql status"
+			}
+			if len(d.Commands) == 0 || d.Commands[0].Text != wantCommand {
+				t.Fatalf("復旧コマンドが診断と対応しない: %+v", d.Commands)
+			}
 			text := formatDiagnostic(d)
 			if !strings.Contains(text, tc.want) || strings.Contains(text, tc.avoid) {
 				t.Fatalf("対処が違う: %s", text)
@@ -96,6 +109,9 @@ func TestDiagnosticSecretValues(t *testing.T) {
 func TestDiagnosticMissingGcloudAndWindowsUI(t *testing.T) {
 	a, _, _ := testApp(t)
 	d := explainFailure(a.failureContext(context.Background(), "proxy", "接続", testInstance(), false), "invalid_rapt")
+	if len(d.Commands) != 2 || d.Commands[1].Text != "csql setup --install" {
+		t.Fatalf("未導入時のコピー候補: %+v", d.Commands)
+	}
 	if !strings.Contains(d.Next, "csql setup --install") || !strings.Contains(d.Next, "auth application-default login") {
 		t.Fatalf("未導入時の復旧手順なし: %s", d.Next)
 	}

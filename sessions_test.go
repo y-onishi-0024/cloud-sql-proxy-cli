@@ -24,6 +24,10 @@ import (
 )
 
 func TestMain(m *testing.M) {
+	if os.Getenv("CSQL_TEST_CLIPBOARD") != "" {
+		os.Exit(runClipboardFixture())
+	}
+
 	if os.Getenv("CSQL_TEST_UI_DIR") != "" {
 		if len(os.Args) > 1 && os.Args[1] == "--address" {
 			os.Setenv("CSQL_TEST_PROXY", "1")

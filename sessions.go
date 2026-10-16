@@ -67,6 +67,7 @@ func (p *connectionProgress) Snapshot() connectionSnapshot {
 	}
 	if s.Diagnostic != nil {
 		d := *s.Diagnostic
+		d.Commands = append([]RecoveryCommand(nil), d.Commands...)
 		s.Diagnostic = &d
 	}
 	return s
