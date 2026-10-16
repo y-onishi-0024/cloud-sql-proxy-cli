@@ -37,7 +37,7 @@ func (m *connectUI) connection(id uint64) *uiConnection {
 }
 func (c *uiConnection) effectiveProfile() Profile {
 	p := c.profile
-	if c.progress != nil {
+	if c.progress != nil && (c.running || p.Port == 0) {
 		if port := c.progress.Snapshot().Session.Port; port > 0 {
 			p.Port = port
 		}
@@ -110,7 +110,7 @@ func (m *connectUI) startConnection(p Profile) tea.Cmd {
 	c := &uiConnection{id: m.nextID, profile: p}
 	m.connections = append(m.connections, c)
 	m.selectedID = c.id
-	m.state = "connecting"
+	m.showConnections()
 	m.message = ""
 	m.diagnostic = nil
 	return m.launchConnection(c)
@@ -119,11 +119,11 @@ func (m *connectUI) startConnection(p Profile) tea.Cmd {
 // 同じProxyの再利用では選択した保存済み設定のDB・ユーザーを保持する。
 func (m *connectUI) focusConnection(c *uiConnection, p Profile) {
 	m.selectedID = c.id
-	m.state = "connecting"
+	m.showConnections()
 	m.message = ""
 	live := c.effectiveProfile()
 	if p.PrivateIP != live.PrivateIP || (p.Port != 0 && p.Port != live.Port) {
-		m.message = fmt.Sprintf("このインスタンスは既に %s / Port %d で接続処理中です。変更するにはSで停止後、追加してください", map[bool]string{true: "Private IP", false: "Public IP"}[live.PrivateIP], live.Port)
+		m.message = fmt.Sprintf("このインスタンスは既に %s / Port %d で接続処理中です。変更するにはCtrl+Dで停止後、追加してください", map[bool]string{true: "Private IP", false: "Public IP"}[live.PrivateIP], live.Port)
 	} else if p.Name != "" {
 		c.profile = p
 	}

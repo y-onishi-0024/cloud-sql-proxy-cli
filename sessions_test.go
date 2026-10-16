@@ -105,6 +105,12 @@ func TestMain(m *testing.M) {
 		if mode == "lateauth" {
 			fmt.Println(`{"severity":"ERROR","message":"failed to connect: invalid_grant invalid_rapt"}`)
 		}
+		// PTYで一覧を残したログのページ送りを確認するためのfixture出力。
+		if mode == "workspace-long" {
+			for i := 0; i < 80; i++ {
+				fmt.Printf("{\"severity\":\"INFO\",\"message\":\"fixture-log-%03d 日本語の接続ログを表示します\"}\n", i)
+			}
+		}
 		ch := make(chan os.Signal, 1)
 		signal.Notify(ch, terminationSignals()...)
 		for {
@@ -258,6 +264,68 @@ func TestCLIConnectAndSeparateProcessStop(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("別CLI停止後に終了しません")
+	}
+}
+
+// 編集ロック待ちの起動は子を作らず、解除後の設定だけで起動する。
+func TestSessionProfileEditSerialization(t *testing.T) {
+	a := proxyApp(t)
+	p := Profile{Name: "dev", Instance: testInstance(), Database: "app", Username: "reader", Port: 55434}
+	if err := a.AddProfile(context.Background(), p); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.OpenFile(filepath.Join(a.Paths.ConfigDir, "profiles.lock"), os.O_RDWR, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	unlock, err := lockProfiles(context.Background(), f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	argsfile := filepath.Join(t.TempDir(), "args.json")
+	t.Setenv("CSQL_TEST_ARGSFILE", argsfile)
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	err = a.Connect(ctx, p.Instance, ConnectOptions{Progress: &connectionProgress{}})
+	unlock()
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("ロック待ちの取消: %v", err)
+	}
+	if _, err := os.Stat(argsfile); !os.IsNotExist(err) {
+		t.Fatal("編集ロック中にProxyを起動")
+	}
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := l.Addr().(*net.TCPAddr).Port
+	l.Close()
+	if _, err := a.UpdateProfilePort(context.Background(), p.Name, p.Port, port); err != nil {
+		t.Fatal(err)
+	}
+	live, stop := context.WithCancel(context.Background())
+	defer stop()
+	done := make(chan error, 1)
+	go func() { done <- a.Connect(live, p.Instance, ConnectOptions{Progress: &connectionProgress{}}) }()
+	session := awaitSession(t, a)
+	if session.Port != port {
+		t.Fatalf("編集後も旧Port: %+v", session)
+	}
+	before, _ := os.ReadFile(filepath.Join(a.Paths.ConfigDir, "profiles.json"))
+	if _, err := a.UpdateProfilePort(context.Background(), p.Name, port, 55434); err == nil || !strings.Contains(err.Error(), session.ID) {
+		t.Fatalf("稼働中を更新: %v", err)
+	}
+	after, _ := os.ReadFile(filepath.Join(a.Paths.ConfigDir, "profiles.json"))
+	if string(before) != string(after) {
+		t.Fatal("稼働中の拒否で設定を変更")
+	}
+	stop()
+	if err := <-done; err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatal(err)
+	}
+	if _, err := a.UpdateProfilePort(context.Background(), p.Name, port, 55434); err != nil {
+		t.Fatalf("停止後に変更できない: %v", err)
 	}
 }
 

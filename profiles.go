@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -120,33 +121,59 @@ func (a *App) LoadProfiles() ([]Profile, error) {
 	}
 	return store.Profiles, nil
 }
-func (a *App) changeProfiles(ctx context.Context, change func([]Profile) ([]Profile, error)) error {
+
+// 設定更新とProxy起動で同じ排他を使い、予約参照から管理記録公開までを保護する。
+func (a *App) lockProfileStore(ctx context.Context) (func(), error) {
 	if err := ctx.Err(); err != nil {
-		return err
+		return nil, err
 	}
 	if err := secureDir(a.Paths.ConfigDir); err != nil {
-		return err
+		return nil, err
 	}
 	file := filepath.Join(a.Paths.ConfigDir, "profiles.lock")
 	if fi, err := os.Lstat(file); err == nil && !fi.Mode().IsRegular() {
-		return fmt.Errorf("lockファイルが不正です: %s", file)
+		return nil, fmt.Errorf("lockファイルが不正です: %s", file)
 	} else if err != nil && !os.IsNotExist(err) {
-		return err
+		return nil, err
 	}
 	f, err := os.OpenFile(file, os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	defer f.Close()
 	actual, err := f.Stat()
 	if err != nil {
-		return err
+		f.Close()
+		return nil, err
 	}
 	fi, err := os.Lstat(file)
 	if err != nil || !fi.Mode().IsRegular() || !os.SameFile(fi, actual) {
-		return fmt.Errorf("lockファイルが変わりました: %s", file)
+		f.Close()
+		return nil, fmt.Errorf("lockファイルが変わりました: %s", file)
 	}
 	unlock, err := lockProfiles(ctx, f)
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	var once sync.Once
+	release := func() { once.Do(func() { unlock(); _ = f.Close() }) }
+	fi, err = os.Lstat(file)
+	if err != nil || !fi.Mode().IsRegular() || !os.SameFile(fi, actual) {
+		release()
+		return nil, fmt.Errorf("待機中にlockファイルが変わりました: %s", file)
+	}
+	if err := realParents(a.Paths.ConfigDir); err != nil {
+		release()
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		release()
+		return nil, err
+	}
+	return release, nil
+}
+func (a *App) changeProfiles(ctx context.Context, change func([]Profile) ([]Profile, error)) error {
+	unlock, err := a.lockProfileStore(ctx)
 	if err != nil {
 		return err
 	}
@@ -159,9 +186,14 @@ func (a *App) changeProfiles(ctx context.Context, change func([]Profile) ([]Prof
 	if err != nil {
 		return err
 	}
-	if err = ctx.Err(); err != nil {
+	if err := ctx.Err(); err != nil {
 		return err
 	}
+	return a.writeProfiles(rows)
+}
+
+// 呼び出し元が設定ロックを所有したまま、全設定を原子的に保存する。
+func (a *App) writeProfiles(rows []Profile) error {
 	sort.Slice(rows, func(i, j int) bool { return rows[i].Name < rows[j].Name })
 	store := profileStore{1, rows}
 	b, err := json.Marshal(store)
@@ -172,6 +204,67 @@ func (a *App) changeProfiles(ctx context.Context, change func([]Profile) ([]Prof
 		return fmt.Errorf("保存する設定が1MiBを超えます")
 	}
 	return writeJSON(filepath.Join(a.Paths.ConfigDir, "profiles.json"), store)
+}
+
+// 同一インスタンスの予約を一括更新し、別プロセスの起動・編集とも直列化する。
+func (a *App) UpdateProfilePort(ctx context.Context, name string, expectedPort, newPort int) ([]Profile, error) {
+	if newPort < 1 || newPort > 65535 {
+		return nil, usageError{fmt.Errorf("Portは1〜65535を指定してください")}
+	}
+	unlock, err := a.lockProfileStore(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	rows, err := a.LoadProfiles()
+	if err != nil {
+		return nil, err
+	}
+	p, err := findProfile(rows, name)
+	if err != nil {
+		return nil, err
+	}
+	if p.Port != expectedPort {
+		return nil, fmt.Errorf("保存済みPortが %d から %d に変更されています。設定を再表示してから操作してください", expectedPort, p.Port)
+	}
+	if p.Port == newPort {
+		return rows, nil
+	}
+	records, err := a.records()
+	if err != nil {
+		return nil, err
+	}
+	unavailable := a.reservedProxyPorts()
+	if unavailable == nil {
+		unavailable = map[int]bool{}
+	}
+	for _, r := range records {
+		if r.Project == p.Project && r.Name == p.Instance.Name && r.Region == p.Region {
+			check, cancel := context.WithTimeout(ctx, 2*time.Second)
+			status, e := a.querySession(check, r, false)
+			cancel()
+			if e != nil || status.State != "stopped" {
+				return nil, fmt.Errorf("セッション %s の停止を確認できません。csql status で確認し、csql stop %s または起動した端末のCtrl+Cで停止してから変更してください", r.ID, r.ID)
+			}
+		} else {
+			unavailable[r.Port] = true
+		}
+	}
+	if _, err := availableProfilePort(p.Instance, newPort, rows, unavailable); err != nil {
+		return nil, err
+	}
+	for i := range rows {
+		if rows[i].ConnectionName == p.ConnectionName {
+			rows[i].Port = newPort
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := a.writeProfiles(rows); err != nil {
+		return nil, err
+	}
+	return rows, nil
 }
 func (a *App) AddProfile(ctx context.Context, p Profile) error {
 	if err := validateProfile(p); err != nil {
@@ -467,6 +560,40 @@ func (a *App) profileCommand() *cobra.Command {
 	}
 	add.Flags().IntP("port", "p", 0, "保存するローカルPort（省略時は選択）")
 	add.Flags().Bool("private-ip", false, "Private IPで接続")
+	update := &cobra.Command{Use: "update NAME", Short: "停止済みの保存設定のPortを変更", Args: argCount(1), RunE: func(c *cobra.Command, args []string) error {
+		if !c.Flags().Changed("port") {
+			return usageError{fmt.Errorf("--port を指定してください")}
+		}
+		port, _ := c.Flags().GetInt("port")
+		if port < 1 || port > 65535 {
+			return usageError{fmt.Errorf("Portは1〜65535を指定してください")}
+		}
+		rows, err := a.LoadProfiles()
+		if err != nil {
+			return err
+		}
+		p, err := findProfile(rows, args[0])
+		if err != nil {
+			return err
+		}
+		var names []string
+		for _, row := range rows {
+			if row.ConnectionName == p.ConnectionName {
+				names = append(names, row.Name)
+			}
+		}
+		fmt.Fprintf(a.stdout(), "更新対象: %s / Port %d → %d / 設定: %s\n", p.ConnectionName, p.Port, port, strings.Join(names, ", "))
+		if _, err = a.UpdateProfilePort(c.Context(), p.Name, p.Port, port); err != nil {
+			return err
+		}
+		if p.Port == port {
+			fmt.Fprintln(a.stdout(), "変更はありません")
+			return nil
+		}
+		fmt.Fprintln(a.stdout(), "Portを更新しました。DBツール側のPortを変更するか、csql profile exportで再出力してください")
+		return nil
+	}}
+	update.Flags().IntP("port", "p", 0, "変更先のローカルPort（必須）")
 	list := &cobra.Command{Use: "list", Short: "保存した接続設定", Args: argCount(0), RunE: func(c *cobra.Command, _ []string) error {
 		rows, err := a.LoadProfiles()
 		if err != nil {
@@ -522,6 +649,6 @@ func (a *App) profileCommand() *cobra.Command {
 	}}
 	export.Flags().String("format", "", "出力形式（pgadmin|dbeaver|a5|uri）")
 	export.Flags().String("output", "", "新規出力ファイル（省略時は標準出力）")
-	root.AddCommand(add, list, remove, export)
+	root.AddCommand(add, list, remove, export, update)
 	return root
 }

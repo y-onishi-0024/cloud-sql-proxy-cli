@@ -81,6 +81,14 @@ func (h *connectionsHarness) key(key string) {
 		msg.Type = tea.KeyCtrlC
 	case "ctrl+s":
 		msg.Type = tea.KeyCtrlS
+	case "ctrl+e":
+		msg.Type = tea.KeyCtrlE
+	case "ctrl+l":
+		msg.Type = tea.KeyCtrlL
+	case "ctrl+r":
+		msg.Type = tea.KeyCtrlR
+	case "ctrl+o":
+		msg.Type = tea.KeyCtrlO
 	case "ctrl+d":
 		msg.Type = tea.KeyCtrlD
 	}
@@ -89,7 +97,7 @@ func (h *connectionsHarness) key(key string) {
 
 // 画面の共通エクスポート入口を通して、対象ツールを選択する。
 func (h *connectionsHarness) exportTool(format string) {
-	h.key("e")
+	h.key("ctrl+e")
 	for _, tool := range exportTools {
 		if tool.format == format {
 			h.key("enter")
@@ -102,7 +110,16 @@ func (h *connectionsHarness) exportTool(format string) {
 
 func (h *connectionsHarness) until(text string) {
 	h.t.Helper()
-	h.pumpUntil(func() bool { return strings.Contains(h.m.View(), text) }, text)
+	h.pumpUntil(func() bool {
+		if text == "Proxy利用可能" {
+			c := h.m.actionConnection()
+			if c == nil {
+				c = h.m.selectedConnection()
+			}
+			return c != nil && c.status() == text
+		}
+		return strings.Contains(h.m.View(), text)
+	}, text)
 }
 func (h *connectionsHarness) pumpUntil(done func() bool, label string) {
 	h.t.Helper()
@@ -119,6 +136,267 @@ func (h *connectionsHarness) pumpUntil(done func() bool, label string) {
 }
 
 // 追加・一覧切替で既存の接続を切らず、停止操作は選択した1件だけに作用する。
+// 接続後は一覧に留まり、停止後のPort編集・ログ・再試行を選択行へ適用する。
+func TestConnectionsWorkspaceActions(t *testing.T) {
+	a := proxyApp(t)
+	t.Setenv("CSQL_TEST_BIND", "1")
+	p := Profile{Name: "dev", Instance: testInstance(), Database: "app", Username: "reader", Port: 55448}
+	if err := a.AddProfile(context.Background(), p); err != nil {
+		t.Fatal(err)
+	}
+	h := newConnectionsHarness(t, a)
+	h.m.profiles, _ = a.LoadProfiles()
+	h.m.tab = tabProfiles
+	h.key("enter")
+	h.until("Proxy利用可能")
+	if h.m.state != "list" || h.m.tab != tabConnections {
+		t.Fatalf("接続後に一覧から離れた: %s", h.m.state)
+	}
+	h.key("ctrl+l")
+	if !strings.Contains(h.m.View(), "ログ") {
+		t.Fatal("一覧にログがない")
+	}
+	h.key("ctrl+e")
+	if h.m.state != "exportTools" {
+		t.Fatal("一覧から出力できない")
+	}
+	h.key("esc")
+	if h.m.state != "list" {
+		t.Fatal("出力取消で一覧へ戻らない")
+	}
+	h.key("ctrl+d")
+	h.until("停止済み")
+	h.key("enter")
+	for i := 0; i < 3; i++ {
+		h.key("down")
+	}
+	h.key("enter")
+	if h.m.state != "portForm" {
+		t.Fatalf("Port編集へ進めない: %s", h.m.state)
+	}
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := l.Addr().(*net.TCPAddr).Port
+	l.Close()
+	h.m.fields[0].value = fmt.Sprint(port)
+	h.key("ctrl+s")
+	h.until("Portを更新")
+	if h.m.state != "list" || h.m.connections[0].effectiveProfile().Port != port {
+		t.Fatal("停止済み行が旧Portのまま")
+	}
+	h.key("ctrl+r")
+	h.until("Proxy利用可能")
+	session := awaitSession(t, a)
+	if session.Port != port {
+		t.Fatalf("再試行が旧Port: %+v", session)
+	}
+}
+
+func TestConnectionsWorkspaceSelection(t *testing.T) {
+	a, _, _ := testApp(t)
+	h := newConnectionsHarness(t, a)
+	first := Profile{Name: "first", Instance: testInstance(), Database: "first-db", Username: "first-user", Port: 55441}
+	second := first
+	second.Name = "second"
+	second.Instance.Name = "second"
+	second.ConnectionName = "alpha:asia-northeast1:second"
+	second.Database = "second-db"
+	second.Port = 55442
+	h.m.connections = []*uiConnection{{id: 1, attempt: 1, profile: first, progress: &connectionProgress{}}, {id: 2, attempt: 1, profile: second, progress: &connectionProgress{}}}
+	h.m.selectedID = 1
+	h.m.tab = tabConnections
+	h.key("second")
+	h.key("ctrl+s")
+	if h.m.state != "form" || h.m.fields[1].value != "second-db" {
+		t.Fatal("過去の選択へ保存を向けた")
+	}
+	h.key("esc")
+	if h.m.state != "list" || h.m.selector.query != "second" {
+		t.Fatal("検索を失った")
+	}
+	h.key("ctrl+e")
+	h.key("enter")
+	if !strings.Contains(h.m.fields[0].value, "second-pgadmin") {
+		t.Fatal("過去の行を出力")
+	}
+	h.update(connectionFinished{id: 1, attempt: 1, err: fmt.Errorf("背景の失敗")})
+	if h.m.state != "export" {
+		t.Fatal("背景終了が出力を奪った")
+	}
+	h.key("esc")
+	h.key("esc")
+	if h.m.selector.query != "second" {
+		t.Fatal("出力取消で検索を失った")
+	}
+	h.key("not-found")
+	h.key("ctrl+e")
+	h.key("ctrl+d")
+	if h.m.state != "list" {
+		t.Fatal("0件で過去の行を操作")
+	}
+	h.key("e")
+	if !strings.HasSuffix(h.m.selector.query, "e") {
+		t.Fatal("通常文字Eで出力")
+	}
+	h.update(tea.KeyMsg{Type: tea.KeyCtrlU})
+	for i := 0; i < 100; i++ {
+		h.m.connections[0].progress.snapshot.Logs = append(h.m.connections[0].progress.snapshot.Logs, fmt.Sprintf("log-%03d", i))
+	}
+	h.m.message = ""
+	h.key("ctrl+l")
+	h.update(tea.WindowSizeMsg{Width: 60, Height: 16})
+	if body := h.m.View(); !strings.Contains(body, "db · 停止済み") || !strings.Contains(body, "log-099") || !strings.Contains(body, "Ctrl+C") {
+		t.Fatalf("狭幅で一覧・ログ・終了案内を喪失: %s", body)
+	}
+	h.update(tea.KeyMsg{Type: tea.KeyPgUp})
+	if strings.Contains(h.m.View(), "log-099") {
+		t.Fatal("過去ログへ送れない")
+	}
+	h.key("down")
+	if !strings.Contains(h.m.View(), "second") || strings.Contains(h.m.View(), "log-099") {
+		t.Fatal("ログが選択行に追従しない")
+	}
+}
+
+// 実Proxy終了後、完了通知が未配送でも成功した設定更新を画面に残す。
+func TestConnectionsPortUpdateBeforeFinish(t *testing.T) {
+	a, _, _ := testApp(t)
+	p := Profile{Name: "dev", Instance: testInstance(), Database: "app", Username: "reader", Port: 5432}
+	if err := a.AddProfile(context.Background(), p); err != nil {
+		t.Fatal(err)
+	}
+	h := newConnectionsHarness(t, a)
+	h.m.profiles, _ = a.LoadProfiles()
+	h.m.tab = tabProfiles
+	h.m.connections = []*uiConnection{{id: 1, attempt: 1, profile: p, running: true, progress: &connectionProgress{snapshot: connectionSnapshot{Session: SessionStatus{Port: p.Port}}}}}
+	h.m.selectedID = 1
+	h.key("ctrl+o")
+	h.key("enter")
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := l.Addr().(*net.TCPAddr).Port
+	l.Close()
+	h.m.fields[0].value = fmt.Sprint(port)
+	h.key("ctrl+s")
+	h.until("Portを更新")
+	h.update(connectionFinished{id: 1, attempt: 1, err: context.Canceled})
+	h.key("tab")
+	h.key("ctrl+e")
+	h.key("enter")
+	if !strings.Contains(h.m.exportData, fmt.Sprint(port)) {
+		t.Fatalf("終了通知後に旧Portへ戻った: %s", h.m.exportData)
+	}
+}
+
+func TestConnectionsWorkspaceDiagnosticDetail(t *testing.T) {
+	a, _, _ := testApp(t)
+	h := newConnectionsHarness(t, a)
+	h.m.tab = tabConnections
+	p := Profile{Name: "dev", Instance: testInstance(), Database: "app", Username: "reader", Port: 5432}
+	h.m.connections = []*uiConnection{{id: 1, profile: p, err: fmt.Errorf("specific-config-error"), diagnostic: &Diagnostic{Cause: "操作できません", Next: "設定を確認してください", Detail: "具体的な失敗: specific-config-error"}}}
+	h.update(tea.WindowSizeMsg{Width: 60, Height: 16})
+	h.key("ctrl+l")
+	found := false
+	for i := 0; i < 10; i++ {
+		if strings.Contains(h.m.View(), "specific-config-error") {
+			found = true
+			break
+		}
+		h.update(tea.KeyMsg{Type: tea.KeyPgDown})
+	}
+	if !found {
+		t.Fatal("Proxyログが空の失敗で具体的エラーを表示できない")
+	}
+}
+
+func TestConnectionsOutputResetsPage(t *testing.T) {
+	a, _, _ := testApp(t)
+	h := newConnectionsHarness(t, a)
+	h.m.tab = tabConnections
+	p := Profile{Name: "dev", Instance: testInstance(), Database: "app", Username: "reader", Port: 5432}
+	h.m.connections = []*uiConnection{{id: 1, attempt: 1, profile: p, recoveryPage: 1}}
+	h.update(tea.WindowSizeMsg{Width: 60, Height: 16})
+	h.key("ctrl+e")
+	h.key("enter")
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.m.fields[0].value = filepath.Join(dir, "servers.json")
+	h.key("enter")
+	h.pumpUntil(func() bool { return h.m.state == "list" }, "出力から一覧へ")
+	if !strings.Contains(h.m.View(), "ファイルへ出力しました") {
+		t.Fatal("前回のページ位置で新しい完了案内が隠れた")
+	}
+}
+
+func TestConnectionsSearchNoticeDoesNotCoverWorkspace(t *testing.T) {
+	a, _, _ := testApp(t)
+	h := newConnectionsHarness(t, a)
+	h.m.notices = []string{"検索の注意"}
+	h.key("ctrl+l")
+	if !strings.Contains(h.m.View(), "検索の詳細") {
+		t.Fatal("検索注意を表示できない")
+	}
+	h.key("enter")
+	if strings.Contains(h.m.View(), "検索の詳細") || !strings.Contains(h.m.View(), "接続一覧") {
+		t.Fatal("検索注意が接続一覧を覆った")
+	}
+	h.m.showLogs = true
+	if strings.Contains(h.m.View(), "検索の詳細") {
+		t.Fatal("別タブの注意状態で接続一覧が隠れる")
+	}
+}
+
+func TestConnectionsPortFormUsesTargetMetadata(t *testing.T) {
+	a, _, _ := testApp(t)
+	target := Profile{Name: "target", Instance: testInstance(), Database: "target-db", Username: "reader", Port: 55443}
+	target.Project = "target-project"
+	target.ConnectionName = "target-project:asia-northeast1:db"
+	if err := a.AddProfile(context.Background(), target); err != nil {
+		t.Fatal(err)
+	}
+	h := newConnectionsHarness(t, a)
+	old := target
+	old.Project = "old-project"
+	old.ConnectionName = "old-project:asia-northeast1:db"
+	h.m.connections = []*uiConnection{{id: 1, profile: old}}
+	h.m.selectedID = 1
+	h.m.tab = tabProfiles
+	h.m.profiles, _ = a.LoadProfiles()
+	h.update(tea.WindowSizeMsg{Width: 60, Height: 16})
+	h.key("ctrl+o")
+	if body := h.m.View(); strings.Contains(body, "old-project") || !strings.Contains(body, "target-project") {
+		t.Fatalf("操作メニューの対象が混線: %s", body)
+	}
+	h.key("enter")
+	if body := h.m.View(); strings.Contains(body, "old-project") || !strings.Contains(body, "target-project") {
+		t.Fatalf("Port確認の対象が混線: %s", body)
+	}
+}
+
+func TestConnectionsSaveWithoutStarting(t *testing.T) {
+	a, _, _ := testApp(t)
+	p := Profile{Name: "dev", Instance: testInstance(), Database: "app", Username: "reader", Port: 5432}
+	if err := a.AddProfile(context.Background(), p); err != nil {
+		t.Fatal(err)
+	}
+	h := newConnectionsHarness(t, a)
+	h.m.profiles, _ = a.LoadProfiles()
+	h.m.tab = tabProfiles
+	h.key("ctrl+s")
+	h.m.fields[0].value = "copy"
+	h.key("ctrl+s")
+	h.until("保存しました: copy")
+	if h.m.state != "list" || len(h.m.connections) != 0 {
+		t.Fatal("保存だけでProxyを開始")
+	}
+}
+
 func TestConnectionsAddSwitchAndStop(t *testing.T) {
 	a := proxyApp(t)
 	t.Setenv("CSQL_TEST_BIND", "1")
@@ -126,7 +404,7 @@ func TestConnectionsAddSwitchAndStop(t *testing.T) {
 	h.key("enter")
 	h.until("Proxy利用可能")
 	first := awaitSession(t, a)
-	h.key("n")
+	h.key("tab")
 	if h.m.state != "list" {
 		t.Fatal("稼働中の接続を保って追加画面へ戻れない")
 	}
@@ -139,7 +417,7 @@ func TestConnectionsAddSwitchAndStop(t *testing.T) {
 		awaitProxyPort(t, row.Port)
 	}
 	h.key("esc")
-	h.m.updateVersion = "v0.5.0"
+	h.m.updateVersion = "v0.6.0"
 	if !strings.Contains(h.m.View(), "稼働 2件") {
 		t.Fatal("更新通知で稼働件数を喪失")
 	}
@@ -147,7 +425,7 @@ func TestConnectionsAddSwitchAndStop(t *testing.T) {
 		t.Fatal("Escが接続を停止し、接続一覧へ戻らない")
 	}
 	h.key("enter")
-	h.key("s")
+	h.key("ctrl+d")
 	h.until("停止済み")
 	remaining := awaitSessions(t, a, 1)
 	awaitProxyPort(t, remaining[0].Port)
@@ -163,13 +441,13 @@ func TestConnectionsDelayedResultsAndRetry(t *testing.T) {
 	h.key("enter")
 	c := h.m.selectedConnection()
 	h.pumpUntil(func() bool { rows, _ := a.Status(context.Background()); return len(rows) == 1 }, "bind前の起動")
-	h.key("n")
+	h.key("tab")
 	h.key("enter")
 	if len(h.m.connections) != 1 || h.m.selectedID != c.id {
 		t.Fatal("起動待ちの同じインスタンスを重複起動")
 	}
-	h.key("r")
-	h.key("r")
+	h.key("ctrl+r")
+	h.key("ctrl+r")
 	h.pumpUntil(func() bool { return c.attempt == 2 }, "終了後に同じIDを再試行")
 	h.update(connectionFinished{id: c.id, attempt: 1, err: fmt.Errorf("古い失敗")})
 	if !c.running || c.err != nil || c.attempt != 2 {
@@ -180,7 +458,7 @@ func TestConnectionsDelayedResultsAndRetry(t *testing.T) {
 	}
 	h.until("Proxy利用可能")
 	first := awaitSession(t, a)
-	h.key("n")
+	h.key("tab")
 	h.key("down")
 	h.key("enter")
 	h.until("Proxy利用可能")
@@ -230,13 +508,14 @@ func TestConnectionsSaveAndExportOwnership(t *testing.T) {
 			h.key("enter")
 			h.until("Proxy利用可能")
 			first := h.m.selectedConnection()
-			h.key("n")
+			h.key("tab")
 			h.key("down")
 			h.key("enter")
 			h.until("Proxy利用可能")
 			second := h.m.selectedConnection()
 			awaitSessions(t, a, 2)
 			h.m.selectedID = first.id
+			h.m.selector.cursor = 0
 			h.key("ctrl+s")
 			h.m.fields[0].value, h.m.fields[1].value, h.m.fields[2].value = "first", "業務/db", "reader"
 			actualPort := first.effectiveProfile().Port
@@ -296,8 +575,6 @@ func TestConnectionsSaveAndExportOwnership(t *testing.T) {
 				} else if !strings.Contains(string(data), fmt.Sprintf("reader@127.0.0.1:%d/", actualPort)) || !strings.Contains(string(data), "%E6%A5%AD%E5%8B%99%2Fdb") {
 					t.Fatalf("URI対象が混線: %s", data)
 				}
-				h.key("esc")
-				h.key("esc")
 			}
 		})
 	}
@@ -327,7 +604,7 @@ func TestConnectionsShutdownIsolation(t *testing.T) {
 	h := newConnectionsHarness(t, a)
 	h.key("enter")
 	h.until("Proxy利用可能")
-	h.key("n")
+	h.key("tab")
 	h.key("down")
 	h.key("enter")
 	h.until("Proxy利用可能")
@@ -358,9 +635,10 @@ func TestConnectionsNavigationDuringSearch(t *testing.T) {
 	// 起動直後はPort未確定なので、未確定の設定を保存フォームへ持ち込まない。
 	m.connections = []*uiConnection{{id: 1, attempt: 1, profile: Profile{Instance: testInstance()}, running: true, progress: &connectionProgress{}}}
 	m.selectedID = 1
-	m.state = "connecting"
+	m.state = "list"
+	m.tab = tabConnections
 	h.key("ctrl+s")
-	if m.state != "connecting" || !strings.Contains(m.message, "Portの確定") {
+	if m.state != "list" || !strings.Contains(m.message, "Portの確定") {
 		t.Fatal("起動前の未確定Portを保存できる")
 	}
 	m.connections[0].progress.snapshot.Session.Port = 55439
@@ -369,7 +647,7 @@ func TestConnectionsNavigationDuringSearch(t *testing.T) {
 	m.request.Project = "alpha"
 	m.request.PrivateIP = true
 	m.allInstances = append([]Instance(nil), m.selector.rows...)
-	h.key("n")
+	h.key("tab")
 	if m.request.Query != "" || m.request.Project != "alpha" || !m.request.PrivateIP || len(m.selector.rows) != 2 {
 		t.Fatal("追加時の検索範囲/初期条件が不正")
 	}
@@ -388,7 +666,6 @@ func TestConnectionsNavigationDuringSearch(t *testing.T) {
 	if m.state != "list" || m.tab != tabConnections || !m.connections[0].running {
 		t.Fatal("検索エラーで接続一覧を終了")
 	}
-	h.key("enter")
 	h.key("ctrl+s")
 	if m.state != "form" {
 		t.Fatal("稼働中の保存フォームへ進めない")
@@ -403,7 +680,6 @@ func TestConnectionsNavigationDuringSearch(t *testing.T) {
 	if !strings.Contains(m.View(), "ADC") {
 		t.Fatal("フォームを戻った際に接続ごとの復旧案内がない")
 	}
-	h.key("esc")
 	if !strings.Contains(m.View(), "エラー") {
 		t.Fatal("非選択のエラーが一覧に表示されない")
 	}
@@ -444,19 +720,19 @@ func TestConnectionsReusesStoppedConnection(t *testing.T) {
 	h.key("enter")
 	h.until("Proxy利用可能")
 	first := h.m.selectedConnection()
-	h.key("s")
+	h.key("ctrl+d")
 	h.until("停止済み")
-	h.key("n")
+	h.key("tab")
 	h.key("enter")
 	if len(h.m.connections) != 1 || h.m.selectedID != first.id {
 		t.Fatal("停止済みの同じ接続を別IDで追加")
 	}
-	h.key("r")
+	h.key("ctrl+r")
 	h.until("Proxy利用可能")
 	if first.attempt != 2 {
 		t.Fatal("停止済みの再試行が同じIDを使わない")
 	}
-	h.key("s")
+	h.key("ctrl+d")
 	h.until("停止済み")
 	// 接続方式を変更して追加する経路は維持し、旧履歴のRから重複させない。
 	changed := first.profile
@@ -465,7 +741,8 @@ func TestConnectionsReusesStoppedConnection(t *testing.T) {
 	h.until("Proxy利用可能")
 	active := h.m.selectedConnection()
 	h.m.selectedID = first.id
-	h.key("r")
+	h.m.selector.cursor = 0
+	h.key("ctrl+r")
 	if h.m.selectedID != active.id || first.running {
 		t.Fatal("古い停止済み接続のRから同じDBを二重起動")
 	}
