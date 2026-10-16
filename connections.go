@@ -123,7 +123,7 @@ func (m *connectUI) focusConnection(c *uiConnection, p Profile) {
 	m.message = ""
 	live := c.effectiveProfile()
 	if p.PrivateIP != live.PrivateIP || (p.Port != 0 && p.Port != live.Port) {
-		m.message = fmt.Sprintf("このインスタンスは既に %s / Port %d で接続処理中です。変更するにはSで停止後、追加してください", map[bool]string{true: "Private IP", false: "Public IP"}[live.PrivateIP], live.Port)
+		m.message = fmt.Sprintf("このインスタンスは既に %s / Port %d で接続処理中です。変更するにはCtrl+Dで停止後、追加してください", map[bool]string{true: "Private IP", false: "Public IP"}[live.PrivateIP], live.Port)
 	} else if p.Name != "" {
 		c.profile = p
 	}

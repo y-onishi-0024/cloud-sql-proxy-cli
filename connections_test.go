@@ -260,6 +260,125 @@ func TestConnectionsWorkspaceSelection(t *testing.T) {
 	}
 }
 
+// 実Proxy終了後、完了通知が未配送でも成功した設定更新を画面に残す。
+func TestConnectionsPortUpdateBeforeFinish(t *testing.T) {
+	a, _, _ := testApp(t)
+	p := Profile{Name: "dev", Instance: testInstance(), Database: "app", Username: "reader", Port: 5432}
+	if err := a.AddProfile(context.Background(), p); err != nil {
+		t.Fatal(err)
+	}
+	h := newConnectionsHarness(t, a)
+	h.m.profiles, _ = a.LoadProfiles()
+	h.m.tab = tabProfiles
+	h.m.connections = []*uiConnection{{id: 1, attempt: 1, profile: p, running: true, progress: &connectionProgress{snapshot: connectionSnapshot{Session: SessionStatus{Port: p.Port}}}}}
+	h.m.selectedID = 1
+	h.key("ctrl+o")
+	h.key("enter")
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := l.Addr().(*net.TCPAddr).Port
+	l.Close()
+	h.m.fields[0].value = fmt.Sprint(port)
+	h.key("ctrl+s")
+	h.until("Portを更新")
+	h.update(connectionFinished{id: 1, attempt: 1, err: context.Canceled})
+	h.key("tab")
+	h.key("ctrl+e")
+	h.key("enter")
+	if !strings.Contains(h.m.exportData, fmt.Sprint(port)) {
+		t.Fatalf("終了通知後に旧Portへ戻った: %s", h.m.exportData)
+	}
+}
+
+func TestConnectionsWorkspaceDiagnosticDetail(t *testing.T) {
+	a, _, _ := testApp(t)
+	h := newConnectionsHarness(t, a)
+	h.m.tab = tabConnections
+	p := Profile{Name: "dev", Instance: testInstance(), Database: "app", Username: "reader", Port: 5432}
+	h.m.connections = []*uiConnection{{id: 1, profile: p, err: fmt.Errorf("specific-config-error"), diagnostic: &Diagnostic{Cause: "操作できません", Next: "設定を確認してください", Detail: "具体的な失敗: specific-config-error"}}}
+	h.update(tea.WindowSizeMsg{Width: 60, Height: 16})
+	h.key("ctrl+l")
+	found := false
+	for i := 0; i < 10; i++ {
+		if strings.Contains(h.m.View(), "specific-config-error") {
+			found = true
+			break
+		}
+		h.update(tea.KeyMsg{Type: tea.KeyPgDown})
+	}
+	if !found {
+		t.Fatal("Proxyログが空の失敗で具体的エラーを表示できない")
+	}
+}
+
+func TestConnectionsOutputResetsPage(t *testing.T) {
+	a, _, _ := testApp(t)
+	h := newConnectionsHarness(t, a)
+	h.m.tab = tabConnections
+	p := Profile{Name: "dev", Instance: testInstance(), Database: "app", Username: "reader", Port: 5432}
+	h.m.connections = []*uiConnection{{id: 1, attempt: 1, profile: p, recoveryPage: 1}}
+	h.update(tea.WindowSizeMsg{Width: 60, Height: 16})
+	h.key("ctrl+e")
+	h.key("enter")
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.m.fields[0].value = filepath.Join(dir, "servers.json")
+	h.key("enter")
+	h.pumpUntil(func() bool { return h.m.state == "list" }, "出力から一覧へ")
+	if !strings.Contains(h.m.View(), "ファイルへ出力しました") {
+		t.Fatal("前回のページ位置で新しい完了案内が隠れた")
+	}
+}
+
+func TestConnectionsSearchNoticeDoesNotCoverWorkspace(t *testing.T) {
+	a, _, _ := testApp(t)
+	h := newConnectionsHarness(t, a)
+	h.m.notices = []string{"検索の注意"}
+	h.key("ctrl+l")
+	if !strings.Contains(h.m.View(), "検索の詳細") {
+		t.Fatal("検索注意を表示できない")
+	}
+	h.key("enter")
+	if strings.Contains(h.m.View(), "検索の詳細") || !strings.Contains(h.m.View(), "接続一覧") {
+		t.Fatal("検索注意が接続一覧を覆った")
+	}
+	h.m.showLogs = true
+	if strings.Contains(h.m.View(), "検索の詳細") {
+		t.Fatal("別タブの注意状態で接続一覧が隠れる")
+	}
+}
+
+func TestConnectionsPortFormUsesTargetMetadata(t *testing.T) {
+	a, _, _ := testApp(t)
+	target := Profile{Name: "target", Instance: testInstance(), Database: "target-db", Username: "reader", Port: 55443}
+	target.Project = "target-project"
+	target.ConnectionName = "target-project:asia-northeast1:db"
+	if err := a.AddProfile(context.Background(), target); err != nil {
+		t.Fatal(err)
+	}
+	h := newConnectionsHarness(t, a)
+	old := target
+	old.Project = "old-project"
+	old.ConnectionName = "old-project:asia-northeast1:db"
+	h.m.connections = []*uiConnection{{id: 1, profile: old}}
+	h.m.selectedID = 1
+	h.m.tab = tabProfiles
+	h.m.profiles, _ = a.LoadProfiles()
+	h.update(tea.WindowSizeMsg{Width: 60, Height: 16})
+	h.key("ctrl+o")
+	if body := h.m.View(); strings.Contains(body, "old-project") || !strings.Contains(body, "target-project") {
+		t.Fatalf("操作メニューの対象が混線: %s", body)
+	}
+	h.key("enter")
+	if body := h.m.View(); strings.Contains(body, "old-project") || !strings.Contains(body, "target-project") {
+		t.Fatalf("Port確認の対象が混線: %s", body)
+	}
+}
+
 func TestConnectionsSaveWithoutStarting(t *testing.T) {
 	a, _, _ := testApp(t)
 	p := Profile{Name: "dev", Instance: testInstance(), Database: "app", Username: "reader", Port: 5432}
