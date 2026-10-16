@@ -82,14 +82,14 @@ focused: `go test -race ./... -run 'TestConnectUI|TestConnections|TestRich|TestP
 
 ## 段階3: 独立レビューと最終検証
 
-- [ ] 候補コミットと全差分を固定し、実装者と別のReviewerを1名起動する。設計・本計画・基準/候補SHA・focused証拠を渡し、設定更新の排他、終了順序、操作対象の保持、狭幅表示を監査する。自己確認を独立レビューと呼ばない。
-- [ ] 指摘があれば同じ実装担当が補正し、同じReviewerが候補全体を再確認する。外部契約・保存形式・状態遷移の設計変更が必要なら実装を止めて設計へ戻す。
-- [ ] 最終候補で`go test -race ./... -count=1`、`go test -race -tags installer ./... -run 'TestInstaller|TestSetupPathCLI' -count=1`、`go vet ./...`、`go vet -tags installer ./...`、gofmt、`git diff --check`を確認する。
-- [ ] 最終候補からCLI5環境（darwin/arm64・amd64、linux/arm64・amd64、windows/amd64）を`CGO_ENABLED=0`、`-trimpath -buildvcs=false`でビルドする。`python3 scripts/build-installers.py`でMac2版・Windows版の同梱CLI/manifestと署名・構造を確認する。既存の過去リリースZIPは保持する。
-- [ ] 偽gcloud/Proxyと一時設定のみを使うPTY手順を、既存の`.superpowers/sdd/2026-10-16-db-tool-exports/verify-release-pty.py`を参考に更新する。公開前の旧checkoutやユーザーの実プロファイルは検証先に使わない。
-- [ ] カラー/NO_COLORで、2接続の追加→一覧でログ切替→停止後ポート更新→再試行→4形式出力→保存/取消を確認する。検索後の対象、背景エラー、長いログのスクロール、100列以上/60列×16行、更新通知、日本語消去、Ctrl+Cと外部接続の維持、端末復元を確認する。
-- [ ] 同一候補SHA、実行引数、Go版、環境、結果、未確認範囲を除外済みの`.superpowers/sdd/2026-10-16-connection-workspace/`へ記録する。新しい変更・失敗がなければ成功済み全体gateを理由なく繰り返さない。
-- [ ] 製品の受入条件と工程の完了を分けて報告する。GUIでのDBツール取込、実DB接続、Windowsでのセットアップ操作は未確認とし、公開・インストール済みとは扱わない。
+- [x] 候補コミットと全差分を固定し、実装者と別のReviewerを1名起動する。設計・本計画・基準/候補SHA・focused証拠を渡し、設定更新の排他、終了順序、操作対象の保持、狭幅表示を監査する。自己確認を独立レビューと呼ばない。
+- [x] 指摘があれば同じ実装担当が補正し、同じReviewerが候補全体を再確認する。外部契約・保存形式・状態遷移の設計変更が必要なら実装を止めて設計へ戻す。
+- [x] 最終候補で`go test -race ./... -count=1`、`go test -race -tags installer ./... -run 'TestInstaller|TestSetupPathCLI' -count=1`、`go vet ./...`、`go vet -tags installer ./...`、gofmt、`git diff --check`を確認する。
+- [x] 最終候補からCLI5環境（darwin/arm64・amd64、linux/arm64・amd64、windows/amd64）を`CGO_ENABLED=0`、`-trimpath -buildvcs=false`でビルドする。`python3 scripts/build-installers.py`でMac2版・Windows版の同梱CLI/manifestと署名・構造を確認する。既存の過去リリースZIPは保持する。
+- [x] 偽gcloud/Proxyと一時設定のみを使うPTY手順を、既存の`.superpowers/sdd/2026-10-16-db-tool-exports/verify-release-pty.py`を参考に更新する。公開前の旧checkoutやユーザーの実プロファイルは検証先に使わない。
+- [x] カラー/NO_COLORで、2接続の追加→一覧でログ切替→停止後ポート更新→再試行→4形式出力→保存/取消を確認する。検索後の対象、背景エラー、長いログのスクロール、100列以上/60列×16行、更新通知、日本語消去、Ctrl+Cと外部接続の維持、端末復元を確認する。
+- [x] 同一候補SHA、実行引数、Go版、環境、結果、未確認範囲を除外済みの`.superpowers/sdd/2026-10-16-connection-workspace/`へ記録する。新しい変更・失敗がなければ成功済み全体gateを理由なく繰り返さない。
+- [x] 製品の受入条件と工程の完了を分けて報告する。GUIでのDBツール取込、実DB接続、Windowsでのセットアップ操作は未確認とし、公開・インストール済みとは扱わない。
 
 ## 実行環境と完了境界
 
