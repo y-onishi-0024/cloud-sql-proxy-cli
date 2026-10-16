@@ -1077,3 +1077,158 @@ func TestConnectionsSearchRecoveryCopy(t *testing.T) {
 		t.Fatal("コピーされない")
 	}
 }
+
+// 対象行がなくても更新でき、確認/取得を取り消しても接続を維持する。
+func TestConnectionsSelfUpdate(t *testing.T) {
+	for _, mode := range []string{"decline", "cancel", "offline", "lock", "ready", "add-only"} {
+		t.Run(mode, func(t *testing.T) {
+			a, _, _ := testApp(t)
+			gate, started, fail := selfUpdateUIFixture(t, a)
+			h := newConnectionsHarness(t, a)
+			h.m.tab = tabConnections
+			h.m.selector.query = "no-match"
+			liveCtx, liveCancel := context.WithCancel(h.ctx)
+			h.m.connections = []*uiConnection{{id: 1, attempt: 1, profile: Profile{Name: "live", Instance: testInstance()}, running: true, cancel: liveCancel}}
+			t.Cleanup(func() {
+				if h.m.pendingUpdate != nil {
+					h.m.pendingUpdate.Close()
+				}
+			})
+			if mode == "add-only" {
+				h.m.addOnly = true
+				h.key("ctrl+k")
+				h.key("update")
+				h.key("enter")
+				if h.m.state != "actions" {
+					t.Fatal("保存専用画面で更新開始")
+				}
+				return
+			}
+			h.key("ctrl+k")
+			h.key("update")
+			h.key("enter")
+			if h.m.state != "updateChecking" {
+				t.Fatal("検索0件の共通更新が開かない", h.m.state)
+			}
+			h.pumpUntil(func() bool { return h.m.state == "updateConfirm" }, "更新確認")
+			if !strings.Contains(h.m.View(), "0.8.0") {
+				t.Fatal("版の確認がない")
+			}
+			if mode == "decline" {
+				h.key("enter")
+				if h.m.state != "list" || h.m.selector.query != "no-match" || liveCtx.Err() != nil {
+					t.Fatal("既定取消で位置が戻らない")
+				}
+				return
+			}
+			if mode == "offline" {
+				fail.Store(true)
+			}
+			if mode == "lock" {
+				os.Mkdir(filepath.Join(a.Paths.ConfigDir, ".path-lock"), 0700)
+			}
+			h.key("tab")
+			h.key("enter")
+			h.pumpUntil(func() bool {
+				select {
+				case <-started:
+					return true
+				default:
+					return false
+				}
+			}, "取得開始")
+			if h.m.exit {
+				t.Fatal("取得中に終了")
+			}
+			h.key("ctrl+k")
+			if h.m.state != "updatePreparing" {
+				t.Fatal("準備中に別操作へ移動")
+			}
+			if mode == "cancel" {
+				h.key("esc")
+			} else {
+				close(gate)
+			}
+			if mode == "ready" {
+				h.pumpUntil(func() bool { return h.m.exit }, "更新終了")
+				if h.m.pendingUpdate == nil || h.m.resultErr != nil {
+					t.Fatal("通常取消と更新終了が混ざった")
+				}
+				h.key("ctrl+c")
+				if !errors.Is(h.m.resultErr, ErrCancelled) {
+					t.Fatal("終了中Ctrl+Cを無視")
+				}
+				return
+			}
+			h.pumpUntil(func() bool { return h.m.state == "list" }, "更新失敗/取消から復帰")
+			if h.m.exit || h.m.selector.query != "no-match" || liveCtx.Err() != nil {
+				t.Fatal("失敗で一覧状態を破壊")
+			}
+		})
+	}
+}
+
+// 更新準備が終わるまで接続を維持し、更新終了では自画面のProxyだけを止める。
+func TestConnectionsSelfUpdateShutdown(t *testing.T) {
+	a := proxyApp(t)
+	gate, started, _ := selfUpdateUIFixture(t, a)
+	t.Setenv("CSQL_TEST_BIND", "1")
+	external := proxyApp(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	listener.Close()
+	done := make(chan error, 1)
+	go func() {
+		done <- external.Connect(ctx, testInstance(), ConnectOptions{Port: port, Progress: &connectionProgress{}})
+	}()
+	ext := awaitSession(t, external)
+	defer func() { cancel(); <-done }()
+	h := newConnectionsHarness(t, a)
+	h.key("enter")
+	h.until("Proxy利用可能")
+	h.key("tab")
+	h.key("down")
+	h.key("enter")
+	h.until("Proxy利用可能")
+	awaitSessions(t, a, 2)
+	t.Cleanup(func() {
+		if h.m.pendingUpdate != nil {
+			h.m.pendingUpdate.Close()
+		}
+	})
+	h.key("ctrl+k")
+	h.key("update")
+	h.key("enter")
+	if h.m.state != "updateChecking" {
+		t.Fatal("更新を開始できない")
+	}
+	h.pumpUntil(func() bool { return h.m.state == "updateConfirm" }, "更新確認")
+	h.key("tab")
+	h.key("enter")
+	h.pumpUntil(func() bool {
+		select {
+		case <-started:
+			return true
+		default:
+			return false
+		}
+	}, "取得開始")
+	if rows, _ := a.Status(ctx); len(rows) != 2 {
+		t.Fatal("検証前に接続停止")
+	}
+	close(gate)
+	h.pumpUntil(func() bool { return h.m.exit }, "更新停止")
+	h.m.workers.Wait()
+	if rows, _ := a.Status(ctx); len(rows) != 0 {
+		t.Fatal("更新停止でProxy残留")
+	}
+	if rows, _ := external.Status(ctx); len(rows) != 1 {
+		t.Fatal("外部Proxyを停止")
+	}
+	awaitProxyPort(t, ext.Port)
+}

@@ -11,9 +11,11 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -415,6 +417,81 @@ func TestSelfUpdateCLI(t *testing.T) {
 				}
 			} else if string(contents) != "previous csql binary" {
 				t.Fatal("未承認で配置")
+			}
+		})
+	}
+}
+
+// UI用にも本物の取得/検証を通し、HTTP待機だけを境界で制御する。
+func selfUpdateUIFixture(t *testing.T, a *App) (chan struct{}, chan struct{}, *atomic.Bool) {
+	t.Helper()
+	p := selfUpdatePrepared(t, a)
+	p.Close()
+	exe, _ := os.Executable()
+	data, _ := os.ReadFile(exe)
+	sum := sha256.Sum256(data)
+	asset := map[string]any{"name": "csql-0.8.0-" + a.OS + "-" + a.Arch, "size": len(data), "state": "uploaded", "digest": "sha256:" + hex.EncodeToString(sum[:])}
+	body, _ := json.Marshal(map[string]any{"tag_name": "v0.8.0", "assets": []any{asset}})
+	gate, started := make(chan struct{}), make(chan struct{})
+	fail := &atomic.Bool{}
+	a.HTTP = &http.Client{Transport: updateTransport(func(r *http.Request) (*http.Response, error) {
+		payload := body
+		if r.URL.Host != "api.github.com" {
+			close(started)
+			select {
+			case <-gate:
+			case <-r.Context().Done():
+				return nil, r.Context().Err()
+			}
+			if fail.Load() {
+				return nil, errors.New("fixture offline")
+			}
+			payload = data
+		}
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(bytes.NewReader(payload)), ContentLength: int64(len(payload)), Header: make(http.Header)}, nil
+	})}
+	return gate, started, fail
+}
+
+// 再起動後だけがstdinを読み、古い接続引数を引き継がない。
+func runSelfUpdateRestartFixture() int {
+	if os.Getenv("CSQL_TEST_SELF_UPDATE_RESTART") == "parent" {
+		os.Setenv("CSQL_TEST_SELF_UPDATE_RESTART", "child")
+		a := NewApp()
+		if err := restartSelfUpdate(a, os.Getenv("CSQL_TEST_SELF_UPDATE_PATH")); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+		return 0
+	}
+	b, _ := io.ReadAll(os.Stdin)
+	data, _ := json.Marshal(map[string]any{"args": os.Args[1:], "input": string(b)})
+	fmt.Fprintln(os.Stdout, string(data))
+	if os.Getenv("CSQL_TEST_SELF_UPDATE_EXIT") == "1" {
+		return 7
+	}
+	return 0
+}
+func TestSelfUpdateRestartContract(t *testing.T) {
+	exe, _ := os.Executable()
+	for _, failed := range []bool{false, true} {
+		t.Run(fmt.Sprint(failed), func(t *testing.T) {
+			cmd := exec.Command(exe, "--profile", "old-profile")
+			cmd.Env = append(os.Environ(), "CSQL_TEST_SELF_UPDATE_RESTART=parent", "CSQL_TEST_SELF_UPDATE_PATH="+exe)
+			if failed {
+				cmd.Env = append(cmd.Env, "CSQL_TEST_SELF_UPDATE_EXIT=1")
+			}
+			cmd.Stdin = strings.NewReader("child input")
+			out, err := cmd.Output()
+			if (err != nil) != failed {
+				t.Fatal("子の終了結果が異なる", err)
+			}
+			var r struct {
+				Args  []string
+				Input string
+			}
+			if json.Unmarshal(out, &r) != nil || len(r.Args) != 0 || r.Input != "child input" {
+				t.Fatalf("端末/引数の引継ぎが異なる: %s", out)
 			}
 		})
 	}

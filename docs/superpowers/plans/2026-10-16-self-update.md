@@ -91,19 +91,19 @@
 対象: selection.go、connections_test.go、selection_test.go、sessions_test.go、selfupdate_test.go、README.md。
 入力: 段階1/2の共通処理。成果: 検証完了後だけ自画面の接続を止め、新版の一覧へ戻れる。
 
-- [ ] `TestConnectionsSelfUpdate`を既存connectionsHarnessの実キーで追加する。Ctrl+K→更新検索→選択→確認/取消、検索0件・接続選択行消失・保存済み設定/検索エラーで共通入口を確認し、profile addには更新/接続が出ないことを守る。
-- [ ] 同testで更新確認/ダウンロード中の背景進捗、失敗/取消で接続維持、二重開始拒否、setup競合と配置変更で停止前拒否を検証する。staleな結果から接続停止/画面上書きしないこと、Esc後に次の更新を開始できることを確認する。
-- [ ] `TestConnectionsSelfUpdateShutdown`で2本の自画面接続と別所有fixtureを起動し、検証終了/Acquire前には停止せず、その後は自画面だけ停止することを観測する。正常な更新停止とCtrl+Cで終了理由が混ざらないことも確認する。コピー等のworkerも終了を待ち、準備結果がCtrl+Cと競合してもstaging/ロックを解放する。
-- [ ] RED確認後、共通操作ID`self-update`を追加する。captureActionsの行なしを許容するcontextを作り、行操作は対象がなければ無効のままにする。self-updateだけは行のowner/attempt/generation検査へ結び付けず、UIのexit/addOnly/処理中制約を先に検査する。既存の行操作の対象固定を緩めない。
-- [ ] UI状態は`updateChecking`（最新取得）、`updateConfirm`（既定取消）、`updatePreparing`、`updateCancelling`、既存`stopping`を利用する。元のstate/listLocationを専用値へ捕捉し、Esc/準備失敗時に検索/選択を戻す。F1・resize・背景イベントを受け付け、フォーム/保存/出力/Port処理から開始できないようにする。
-- [ ] `uiSelfUpdateResult {operation uint64; offer *selfUpdateOffer; prepared *preparedSelfUpdate; err error}`と専用operation/cancelを使う。準備進捗はmutex付きsnapshotへ書き、UI tickで読む。接続管理workerの進捗から推測しない。
-- [ ] 更新workerは結果配送前に準備結果をjob所有として記録する。Escは取消完了を待ってから入口へ戻し、終了時はworker待機後に未移譲結果をCloseする。結果が未配送でもロック/stagingを解放できるようにする。遅い結果は専用operation一致を確認し、不採用の準備結果を冪等Closeする。
-- [ ] 取得/形式/version検証後、同じworkerでAcquireと再検査を終えてからreadyを配送する。採用したpreparedの所有を`m.pendingUpdate`へ移し、更新専用終了理由`self-update`でbeginShutdownを通す。通常取消は`cancelled`として区別し、Ctrl+Cが優先した場合は適用せずpreparedをCloseする。
-- [ ] runConnectModelはworker待機・代替画面復元後、親ctx取消/通常終了を検査する。self-updateの場合だけpreparedを共通applyへ渡す。applyには取消済みのm.ctxを渡さず、ユーザー終了要求を反映する外側のctxを渡す。失敗なら停止済みと復元状態を表示し、旧版/復元失敗時の復旧方法を示す。旧版一覧を開くか終了の選択は既定終了。UIを再開する場合は新規モデル/新規ctxで起動し、閉じたwork gateを再利用しない。
-- [ ] 成功時はロック/一時FDを解放してからrestartSelfUpdateへ管理先だけを渡す。元のos.Argsを再利用しない。新版の起動に失敗した場合は「更新は完了、再起動に失敗」と絶対パスからの起動方法を表示し、配置成功まで巻き戻さない。
-- [ ] 既存runUIFixture/TestMainにテスト専用の公式API/CLI/version/restart境界を追加する。`TestSelfUpdateRestartContract`で古い--profile/位置引数を渡さないこと、古いモデルが入力を読まないこと、親から子を強制killせず終了状態を返すことを検証する。productionに環境変数で配布先/管理先を差し替える機能は追加しない。
-- [ ] READMEに画面とupdateコマンド、接続停止/再接続、確認・失敗時復旧、raw CLIと初回移行を記載する。既存F1/ヘッダーのURL案内を保ち、Ctrl+K→更新を添える。60x16・NO_COLORでも版/停止/取消/終了を読めるようにする。
-- [ ] focused `go test -race ./... -run 'TestSelfUpdate|TestConnections|TestConnectUI|TestStartupUpdate|TestRich' -count=1`をPASSさせる。既存保存/Port/出力とhelpの回帰も確認し、関連変更をコミットする。
+- [x] `TestConnectionsSelfUpdate`を既存connectionsHarnessの実キーで追加する。Ctrl+K→更新検索→選択→確認/取消、検索0件・接続選択行消失・保存済み設定/検索エラーで共通入口を確認し、profile addには更新/接続が出ないことを守る。
+- [x] 同testで更新確認/ダウンロード中の背景進捗、失敗/取消で接続維持、二重開始拒否、setup競合と配置変更で停止前拒否を検証する。staleな結果から接続停止/画面上書きしないこと、Esc後に次の更新を開始できることを確認する。
+- [x] `TestConnectionsSelfUpdateShutdown`で2本の自画面接続と別所有fixtureを起動し、検証終了/Acquire前には停止せず、その後は自画面だけ停止することを観測する。正常な更新停止とCtrl+Cで終了理由が混ざらないことも確認する。コピー等のworkerも終了を待ち、準備結果がCtrl+Cと競合してもstaging/ロックを解放する。
+- [x] RED確認後、共通操作ID`self-update`を追加する。captureActionsの行なしを許容するcontextを作り、行操作は対象がなければ無効のままにする。self-updateだけは行のowner/attempt/generation検査へ結び付けず、UIのexit/addOnly/処理中制約を先に検査する。既存の行操作の対象固定を緩めない。
+- [x] UI状態は`updateChecking`（最新取得）、`updateConfirm`（既定取消）、`updatePreparing`、`updateCancelling`、既存`stopping`を利用する。元のstate/listLocationを専用値へ捕捉し、Esc/準備失敗時に検索/選択を戻す。F1・resize・背景イベントを受け付け、フォーム/保存/出力/Port処理から開始できないようにする。
+- [x] `uiSelfUpdateResult {operation uint64; offer *selfUpdateOffer; prepared *preparedSelfUpdate; err error}`と専用operation/cancelを使う。準備進捗はmutex付きsnapshotへ書き、UI tickで読む。接続管理workerの進捗から推測しない。
+- [x] 更新workerは結果配送前に準備結果をjob所有として記録する。Escは取消完了を待ってから入口へ戻し、終了時はworker待機後に未移譲結果をCloseする。結果が未配送でもロック/stagingを解放できるようにする。遅い結果は専用operation一致を確認し、不採用の準備結果を冪等Closeする。
+- [x] 取得/形式/version検証後、同じworkerでAcquireと再検査を終えてからreadyを配送する。採用したpreparedの所有を`m.pendingUpdate`へ移し、更新専用終了理由`self-update`でbeginShutdownを通す。通常取消は`cancelled`として区別し、Ctrl+Cが優先した場合は適用せずpreparedをCloseする。
+- [x] runConnectModelはworker待機・代替画面復元後、親ctx取消/通常終了を検査する。self-updateの場合だけpreparedを共通applyへ渡す。applyには取消済みのm.ctxを渡さず、ユーザー終了要求を反映する外側のctxを渡す。失敗なら停止済みと復元状態を表示し、旧版/復元失敗時の復旧方法を示す。旧版一覧を開くか終了の選択は既定終了。UIを再開する場合は新規モデル/新規ctxで起動し、閉じたwork gateを再利用しない。
+- [x] 成功時はロック/一時FDを解放してからrestartSelfUpdateへ管理先だけを渡す。元のos.Argsを再利用しない。新版の起動に失敗した場合は「更新は完了、再起動に失敗」と絶対パスからの起動方法を表示し、配置成功まで巻き戻さない。
+- [x] 既存runUIFixture/TestMainにテスト専用の公式API/CLI/version/restart境界を追加する。`TestSelfUpdateRestartContract`で古い--profile/位置引数を渡さないこと、古いモデルが入力を読まないこと、親から子を強制killせず終了状態を返すことを検証する。productionに環境変数で配布先/管理先を差し替える機能は追加しない。
+- [x] READMEに画面とupdateコマンド、接続停止/再接続、確認・失敗時復旧、raw CLIと初回移行を記載する。既存F1/ヘッダーのURL案内を保ち、Ctrl+K→更新を添える。60x16・NO_COLORでも版/停止/取消/終了を読めるようにする。
+- [x] focused `go test -race ./... -run 'TestSelfUpdate|TestConnections|TestConnectUI|TestStartupUpdate|TestRich' -count=1`をPASSさせる。既存保存/Port/出力とhelpの回帰も確認し、関連変更をコミットする。
 
 ## 段階4: 配布の準備・独立レビュー・最終検証
 
