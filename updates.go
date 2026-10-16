@@ -12,6 +12,8 @@ import (
 	"time"
 )
 
+const updateAPI = "https://api.github.com/repos/y-onishi-0024/cloud-sql-proxy-cli/releases/latest"
+
 const updatePage = "https://github.com/y-onishi-0024/cloud-sql-proxy-cli/releases/latest"
 
 type updateChecked struct{ latest string }
@@ -59,7 +61,7 @@ func (a *App) checkForUpdate(ctx context.Context) string {
 	// 認証やCookieを必要とせず、別ホストへの誘導も受け入れない。
 	client.Jar = nil
 	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.github.com/repos/y-onishi-0024/cloud-sql-proxy-cli/releases/latest", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, updateAPI, nil)
 	if err != nil {
 		return notice
 	}

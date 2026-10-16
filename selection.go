@@ -265,6 +265,15 @@ type connectUI struct {
 	state                                string
 	frame                                int
 	updateVersion                        string
+	pendingUpdate                        *preparedSelfUpdate
+	updateJob                            *uiSelfUpdateJob
+	updateOperation                      uint64
+	updateOrigin                         *actionContext
+	updateOffer                          *selfUpdateOffer
+	updateTarget                         selfUpdateTarget
+	updateYes                            bool
+	updatePage                           int
+	shutdownReason                       string
 	recoveryPage                         int
 	generation                           int
 	searching                            bool
@@ -334,9 +343,14 @@ func (m *connectUI) closeWork() {
 }
 func (m *connectUI) beginShutdown() tea.Cmd {
 	if m.exit {
+		if m.shutdownReason == "self-update" {
+			m.shutdownReason = "cancelled"
+			m.resultErr = ErrCancelled
+		}
 		return nil
 	}
 	m.exit = true
+	m.shutdownReason = "cancelled"
 	m.resultErr = ErrCancelled
 	m.state = "stopping"
 	m.closeWork()
@@ -344,7 +358,7 @@ func (m *connectUI) beginShutdown() tea.Cmd {
 	return func() tea.Msg { m.workers.Wait(); return uiShutdownComplete{} }
 }
 func (m *connectUI) ensureTick() tea.Cmd {
-	if m.exit || m.tickPending || (!m.searching && m.state != "saving" && !m.hasOwnedWork()) {
+	if m.exit || m.tickPending || (!m.searching && m.state != "saving" && !m.hasOwnedWork() && m.updateJob == nil) {
 		return nil
 	}
 	m.tickPending = true
@@ -528,7 +542,7 @@ func (m *connectUI) captureActions() *actionContext {
 			c = m.selectedConnection()
 		}
 		if c == nil {
-			return nil
+			return b
 		}
 		b.owner, b.attempt, b.profile = c.id, c.attempt, c.effectiveProfile()
 		b.location.connectionID = c.id
@@ -619,6 +633,14 @@ func (m *connectUI) availableActions() []uiAction {
 			}
 			rows = append(rows, uiAction{ID: "copy-recovery", Label: cmd.Label + "をコピー", Keywords: "copy command コマンド " + cmd.Text, DisabledReason: reason, Command: cmd})
 		}
+	}
+	if b.location.tab == tabConnections && b.owner == 0 {
+		for i := range rows {
+			rows[i].DisabledReason = "接続先を選択してください"
+		}
+	}
+	if !m.addOnly {
+		rows = append(rows, uiAction{ID: "self-update", Label: "csqlを更新", Keywords: "update 更新 upgrade"})
 	}
 	return rows
 }
@@ -732,6 +754,9 @@ func (m *connectUI) executeShortcut(id string) tea.Cmd {
 	return nil
 }
 func (m *connectUI) executeAction(action uiAction) tea.Cmd {
+	if action.ID == "self-update" {
+		return m.startSelfUpdate()
+	}
 	b := m.actionOrigin
 	if !m.actionValid(b, action.ID == "copy-recovery") {
 		m.message = "対象が更新されました。Escで戻り、操作を選び直してください"
@@ -797,9 +822,11 @@ func (m *connectUI) executeAction(action uiAction) tea.Cmd {
 	return nil
 }
 func (m *connectUI) openHelp() {
-	screen := map[string]string{"list": "一覧", "actions": "操作メニュー", "form": "接続設定の保存", "portForm": "ポート変更", "export": "出力先の入力", "exportTools": "出力ツールの選択", "error": "エラーと対処", "saving": "保存処理中", "searching": "インスタンス検索", "stopping": "終了処理中", "connecting": "接続情報"}[m.state]
+	screen := map[string]string{"list": "一覧", "actions": "操作メニュー", "form": "接続設定の保存", "portForm": "ポート変更", "export": "出力先の入力", "exportTools": "出力ツールの選択", "error": "エラーと対処", "saving": "保存処理中", "searching": "インスタンス検索", "stopping": "終了処理中", "connecting": "接続情報", "updateChecking": "更新情報の確認", "updateConfirm": "csql更新の確認", "updatePreparing": "更新の取得と検証", "updateCancelling": "更新の取消"}[m.state]
 	lines := []string{"現在の画面: " + screen}
 	switch m.state {
+	case "updateChecking", "updateConfirm", "updatePreparing", "updateCancelling":
+		lines = append(lines, "Esc 取消（準備完了前のみ）", "確認後、検証を完了してから自画面の接続を停止", "PgUp/PgDn 詳細  Ctrl+C 全接続停止", "更新後は一覧へ戻り、DBへの再接続は手動です")
 	case "actions":
 		lines = append(lines, "文字入力 操作を検索 / Ctrl+U 消去", "↑↓ / Tab 選択  Enter 実行  Esc 元の一覧")
 	case "form":
@@ -844,7 +871,7 @@ func (m *connectUI) openHelp() {
 		lines = append(lines, "セッション "+session)
 	}
 	if m.updateVersion != "" {
-		lines = append(lines, "", "更新 "+m.updateVersion, updatePage)
+		lines = append(lines, "", "更新 "+m.updateVersion, "Ctrl+K → 更新でcsql内から更新", updatePage)
 	}
 	m.help = &helpOverlay{lines: lines}
 }
@@ -1191,6 +1218,8 @@ func (m *connectUI) beginExport(format string) {
 }
 func (m *connectUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch v := msg.(type) {
+	case uiSelfUpdateResult:
+		return m, m.finishSelfUpdate(v)
 	case uiClipboardResult:
 		if v.operation != m.copyOperation {
 			return m, nil
@@ -1405,6 +1434,9 @@ func (m *connectUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if key != "pgup" && key != "pgdown" {
 			m.interaction++
+		}
+		if strings.HasPrefix(m.state, "update") {
+			return m, m.selfUpdateKey(key)
 		}
 		if m.exit || m.state == "saving" || m.state == "stopping" {
 			return m, nil
@@ -1739,6 +1771,9 @@ func (m *connectUI) View() string {
 		start := page * pageHeight
 		return v.frame("操作ヘルプ", tabs, "ヘルプ", v.panel("操作ヘルプ", rows[start:min(len(rows), start+pageHeight)], width, height-4), []string{fmt.Sprintf("PgUp/PgDn %d/%d  F1/Esc 閉じる", page+1, last+1), "Ctrl+C 全接続停止"})
 	}
+	if strings.HasPrefix(m.state, "update") {
+		return m.selfUpdateView(v, width, height, tabs)
+	}
 	footer := []string{"↑↓ 選択  Enter 接続  Tab 切替  Ctrl+S 保存", "Ctrl+U 消去  Ctrl+L 注意  Esc 戻る  Ctrl+C 全接続停止"}
 	if m.state == "list" {
 		tabs = m.tabsView()
@@ -2070,11 +2105,45 @@ func (a *App) runConnectModel(ctx context.Context, request connectRequest, seed 
 	_, err = tea.NewProgram(m, tea.WithInput(a.In), tea.WithOutput(a.terminalOutput()), tea.WithContext(ctx), tea.WithoutSignalHandler(), tea.WithAltScreen()).Run()
 	m.closeWork()
 	m.workers.Wait()
+	if m.updateJob != nil {
+		m.updateJob.closePrepared()
+	}
+	if m.pendingUpdate != nil {
+		defer m.pendingUpdate.Close()
+	}
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
 	if err != nil {
 		return err
+	}
+	if m.shutdownReason == "self-update" && m.pendingUpdate != nil {
+		p := m.pendingUpdate
+		if err := a.applySelfUpdate(ctx, p); err != nil {
+			fmt.Fprintln(a.stderr(), "この画面の接続は停止済みです。", err)
+			old, _, e := pathRead(p.Target.Path, downloadLimit)
+			receipt, _, re := pathRead(p.Target.Receipt.Path, settingsLimit)
+			if e == nil && re == nil && string(old) == string(p.Target.Binary.Before) && string(receipt) == string(p.Target.Receipt.Before) {
+				ok, confirmErr := a.confirm(ctx, "旧版の一覧を開き直しますか？（再接続は手動） [y/N]")
+				if confirmErr != nil {
+					return confirmErr
+				}
+				if ok {
+					_ = p.Close()
+					return a.runConnectModel(ctx, connectRequest{}, nil)
+				}
+			}
+			return err
+		}
+		_ = p.Close()
+		restart := a.RestartSelf
+		if restart == nil {
+			restart = func(path string) error { return restartSelfUpdate(a, path) }
+		}
+		if err := restart(p.Target.Path); err != nil {
+			return fmt.Errorf("csqlの更新は完了しましたが、新版の起動または終了に問題がありました: %w\n次の操作: %s を起動してください", err, shellQuote(p.Target.Path))
+		}
+		return nil
 	}
 	if seed != nil && m.saved.Name != "" {
 		fmt.Fprintf(a.stdout(), "保存しました: %s / 127.0.0.1:%d\n", m.saved.Name, m.saved.Port)
@@ -2083,4 +2152,231 @@ func (a *App) runConnectModel(ctx context.Context, request connectRequest, seed 
 }
 func (a *App) RunConnectUI(ctx context.Context, request connectRequest) error {
 	return a.runConnectModel(ctx, request, nil)
+}
+
+// 更新結果はUI配送前からjobが所有し、取消や未配送でも確実に後片付けする。
+type uiSelfUpdateJob struct {
+	operation uint64
+	cancel    context.CancelFunc
+	mu        sync.Mutex
+	progress  selfUpdateProgress
+	prepared  *preparedSelfUpdate
+}
+
+func (j *uiSelfUpdateJob) closePrepared() {
+	j.cancel()
+	j.mu.Lock()
+	p := j.prepared
+	j.prepared = nil
+	j.mu.Unlock()
+	if p != nil {
+		_ = p.Close()
+	}
+}
+
+type uiSelfUpdateResult struct {
+	operation uint64
+	offer     *selfUpdateOffer
+	target    selfUpdateTarget
+	prepared  *preparedSelfUpdate
+	err       error
+}
+
+func (m *connectUI) startSelfUpdate() tea.Cmd {
+	if m.exit || m.addOnly || m.updateJob != nil || (m.state != "actions" && m.state != "list" && m.state != "error") {
+		return nil
+	}
+	origin := m.captureActions()
+	if m.state == "actions" {
+		origin = m.actionOrigin
+	}
+	if origin == nil {
+		return nil
+	}
+	copyOrigin := *origin
+	m.updateOrigin = &copyOrigin
+	m.state = "updateChecking"
+	m.message = ""
+	m.updateYes = false
+	m.updatePage = 0
+	m.updateOffer = nil
+	m.updateOperation++
+	ctx, cancel := context.WithCancel(m.ctx)
+	job := &uiSelfUpdateJob{operation: m.updateOperation, cancel: cancel}
+	m.updateJob = job
+	cmd := m.work(ctx, uiSelfUpdateResult{operation: job.operation, err: context.Canceled}, func() tea.Msg {
+		target, err := m.a.inspectSelfUpdateTarget()
+		if err != nil {
+			return uiSelfUpdateResult{operation: job.operation, err: err}
+		}
+		offer, err := m.a.fetchSelfUpdate(ctx)
+		return uiSelfUpdateResult{operation: job.operation, offer: offer, target: target, err: err}
+	})
+	return tea.Batch(cmd, m.ensureTick())
+}
+func (m *connectUI) restoreSelfUpdate(message string) {
+	if b := m.updateOrigin; b != nil {
+		loc := b.location
+		m.location = &loc
+		m.returnToList()
+		if b.state == "error" || b.state == "connecting" {
+			m.state = b.state
+		}
+	}
+	m.message = message
+	m.updateOffer = nil
+	m.updatePage = 0
+}
+func (m *connectUI) finishSelfUpdate(v uiSelfUpdateResult) tea.Cmd {
+	if m.exit || v.operation != m.updateOperation {
+		if v.prepared != nil && v.prepared != m.pendingUpdate {
+			_ = v.prepared.Close()
+		}
+		return nil
+	}
+	job := m.updateJob
+	if job == nil {
+		if v.prepared != nil {
+			_ = v.prepared.Close()
+		}
+		return nil
+	}
+	if m.state == "updateCancelling" {
+		job.closePrepared()
+		m.updateJob = nil
+		m.restoreSelfUpdate("更新を取り消しました。接続は維持しています")
+		return nil
+	}
+	if v.err != nil {
+		job.closePrepared()
+		m.updateJob = nil
+		m.restoreSelfUpdate("更新できませんでした。接続は維持しています\n" + safeLog(v.err.Error()))
+		return nil
+	}
+	if v.offer == nil {
+		job.closePrepared()
+		m.updateJob = nil
+		m.restoreSelfUpdate("csql " + version + " は最新版です。変更はありません")
+		return nil
+	}
+	if v.prepared == nil {
+		job.closePrepared()
+		m.updateJob = nil
+		m.updateOffer = v.offer
+		m.updateTarget = v.target
+		m.state = "updateConfirm"
+		m.updatePage = 0
+		return nil
+	}
+	job.mu.Lock()
+	job.prepared = nil
+	job.mu.Unlock()
+	job.cancel()
+	m.updateJob = nil
+	m.pendingUpdate = v.prepared
+	m.help = nil
+	cmd := m.beginShutdown()
+	m.shutdownReason = "self-update"
+	m.resultErr = nil
+	return cmd
+}
+func (m *connectUI) selfUpdateKey(key string) tea.Cmd {
+	switch key {
+	case "pgup":
+		m.updatePage = max(0, m.updatePage-1)
+		return nil
+	case "pgdown":
+		m.updatePage++
+		return nil
+	case "esc":
+		if m.updateJob != nil {
+			m.updateJob.cancel()
+			m.state = "updateCancelling"
+		} else {
+			m.restoreSelfUpdate("更新を取り消しました。接続は維持しています")
+		}
+		return nil
+	}
+	if m.state != "updateConfirm" {
+		return nil
+	}
+	switch key {
+	case "tab", "left", "right", "up", "down":
+		m.updateYes = !m.updateYes
+	case "enter":
+		if !m.updateYes {
+			m.restoreSelfUpdate("更新を取り消しました。接続は維持しています")
+			return nil
+		}
+		m.state = "updatePreparing"
+		m.updatePage = 0
+		m.updateOperation++
+		ctx, cancel := context.WithCancel(m.ctx)
+		job := &uiSelfUpdateJob{operation: m.updateOperation, cancel: cancel}
+		m.updateJob = job
+		offer, target := *m.updateOffer, m.updateTarget
+		cmd := m.work(ctx, uiSelfUpdateResult{operation: job.operation, err: context.Canceled}, func() tea.Msg {
+			p, err := m.a.prepareSelfUpdate(ctx, offer, target, func(progress selfUpdateProgress) { job.mu.Lock(); job.progress = progress; job.mu.Unlock() })
+			if p != nil {
+				job.mu.Lock()
+				job.prepared = p
+				job.mu.Unlock()
+				if err == nil {
+					err = p.Acquire(ctx)
+				}
+			}
+			return uiSelfUpdateResult{operation: job.operation, offer: &offer, target: target, prepared: p, err: err}
+		})
+		return tea.Batch(cmd, m.ensureTick())
+	}
+	return nil
+}
+func (m *connectUI) selfUpdateView(v terminalView, width, height int, tabs string) string {
+	title, badge := "csqlを更新", "確認中"
+	lines := []string{"最新版と管理先を確認しています。"}
+	if offer := m.updateOffer; offer != nil {
+		count := 0
+		for _, c := range m.connections {
+			if c.running || c.stopping {
+				count++
+			}
+		}
+		lines = []string{"csql " + version + " → " + offer.Tag, fmt.Sprintf("検証後、この画面の接続 %d 件を停止します", count), "更新後は一覧を開き直します。再接続は手動です。"}
+		if m.state == "updateConfirm" {
+			badge = "実行前確認"
+			choice := "[取消]   更新して再起動"
+			if m.updateYes {
+				choice = "取消   [更新して再起動]"
+			}
+			lines = append(lines, "", choice)
+		}
+		if m.updateJob != nil {
+			m.updateJob.mu.Lock()
+			p := m.updateJob.progress
+			m.updateJob.mu.Unlock()
+			badge = p.Phase
+			if badge == "" {
+				badge = "準備中"
+			}
+			lines = append(lines, fmt.Sprintf("%s %d / %d KiB", badge, p.Received/1024, p.Total/1024))
+		}
+		lines = append(lines, "", "配布元: "+offer.URL, "更新先: "+m.updateTarget.Path)
+	}
+	if m.state == "updateCancelling" {
+		badge = "取消中"
+		lines = append(lines, "取消処理の完了を待っています。接続は維持します。")
+	}
+	var wrapped []string
+	for _, line := range lines {
+		wrapped = append(wrapped, strings.Split(ansi.Wrap(safeLog(line), width-4, ""), "\n")...)
+	}
+	size := max(1, height-6)
+	last := max(0, (len(wrapped)-1)/size)
+	page := min(m.updatePage, last)
+	start := page * size
+	footer := []string{fmt.Sprintf("←→/Tab 選択  Enter 確定  PgUp/PgDn %d/%d", page+1, last+1), "Esc 更新取消  Ctrl+C 全接続停止"}
+	if m.state != "updateConfirm" {
+		footer[0] = fmt.Sprintf("PgUp/PgDn 詳細 %d/%d", page+1, last+1)
+	}
+	return v.frame(title, tabs, badge, v.panel(title, wrapped[start:min(len(wrapped), start+size)], width, height-4), footer)
 }

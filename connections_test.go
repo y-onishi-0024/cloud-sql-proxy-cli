@@ -426,7 +426,7 @@ func TestConnectionsAddSwitchAndStop(t *testing.T) {
 		awaitProxyPort(t, row.Port)
 	}
 	h.key("esc")
-	h.m.updateVersion = "v0.6.0"
+	h.m.updateVersion = "v0.8.0"
 	if !strings.Contains(h.m.View(), "稼働 2件") {
 		t.Fatal("更新通知で稼働件数を喪失")
 	}
@@ -1075,5 +1075,255 @@ func TestConnectionsSearchRecoveryCopy(t *testing.T) {
 		}
 	default:
 		t.Fatal("コピーされない")
+	}
+}
+
+// 対象行がなくても更新でき、確認/取得を取り消しても接続を維持する。
+func TestConnectionsSelfUpdate(t *testing.T) {
+	for _, mode := range []string{"decline", "cancel", "offline", "lock", "ready", "add-only"} {
+		t.Run(mode, func(t *testing.T) {
+			a, _, _ := testApp(t)
+			gate, started, fail := selfUpdateUIFixture(t, a)
+			h := newConnectionsHarness(t, a)
+			h.m.tab = tabConnections
+			h.m.selector.query = "no-match"
+			liveCtx, liveCancel := context.WithCancel(h.ctx)
+			h.m.connections = []*uiConnection{{id: 1, attempt: 1, profile: Profile{Name: "live", Instance: testInstance()}, running: true, cancel: liveCancel}}
+			t.Cleanup(func() {
+				if h.m.pendingUpdate != nil {
+					h.m.pendingUpdate.Close()
+				}
+			})
+			if mode == "add-only" {
+				h.m.addOnly = true
+				h.key("ctrl+k")
+				h.key("update")
+				h.key("enter")
+				if h.m.state != "actions" {
+					t.Fatal("保存専用画面で更新開始")
+				}
+				return
+			}
+			h.key("ctrl+k")
+			h.key("update")
+			h.key("enter")
+			if h.m.state != "updateChecking" {
+				t.Fatal("検索0件の共通更新が開かない", h.m.state)
+			}
+			h.pumpUntil(func() bool { return h.m.state == "updateConfirm" }, "更新確認")
+			if !strings.Contains(h.m.View(), "0.8.0") {
+				t.Fatal("版の確認がない")
+			}
+			if mode == "decline" {
+				h.key("enter")
+				if h.m.state != "list" || h.m.selector.query != "no-match" || liveCtx.Err() != nil {
+					t.Fatal("既定取消で位置が戻らない")
+				}
+				return
+			}
+			if mode == "offline" {
+				fail.Store(true)
+			}
+			if mode == "lock" {
+				os.Mkdir(filepath.Join(a.Paths.ConfigDir, ".path-lock"), 0700)
+			}
+			h.key("tab")
+			h.key("enter")
+			h.pumpUntil(func() bool {
+				select {
+				case <-started:
+					return true
+				default:
+					return false
+				}
+			}, "取得開始")
+			if h.m.exit {
+				t.Fatal("取得中に終了")
+			}
+			h.key("ctrl+k")
+			if h.m.state != "updatePreparing" {
+				t.Fatal("準備中に別操作へ移動")
+			}
+			if mode == "cancel" {
+				h.key("esc")
+			} else {
+				close(gate)
+			}
+			if mode == "ready" {
+				h.pumpUntil(func() bool { return h.m.exit }, "更新終了")
+				if h.m.pendingUpdate == nil || h.m.resultErr != nil {
+					t.Fatal("通常取消と更新終了が混ざった")
+				}
+				h.key("ctrl+c")
+				if !errors.Is(h.m.resultErr, ErrCancelled) {
+					t.Fatal("終了中Ctrl+Cを無視")
+				}
+				return
+			}
+			h.pumpUntil(func() bool { return h.m.state == "list" }, "更新失敗/取消から復帰")
+			if h.m.exit || h.m.selector.query != "no-match" || liveCtx.Err() != nil {
+				t.Fatal("失敗で一覧状態を破壊")
+			}
+		})
+	}
+}
+
+// 更新準備が終わるまで接続を維持し、更新終了では自画面のProxyだけを止める。
+func TestConnectionsSelfUpdateShutdown(t *testing.T) {
+	a := proxyApp(t)
+	gate, started, _ := selfUpdateUIFixture(t, a)
+	t.Setenv("CSQL_TEST_BIND", "1")
+	external := proxyApp(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	listener.Close()
+	done := make(chan error, 1)
+	go func() {
+		done <- external.Connect(ctx, testInstance(), ConnectOptions{Port: port, Progress: &connectionProgress{}})
+	}()
+	ext := awaitSession(t, external)
+	defer func() { cancel(); <-done }()
+	h := newConnectionsHarness(t, a)
+	h.key("enter")
+	h.until("Proxy利用可能")
+	h.key("tab")
+	h.key("down")
+	h.key("enter")
+	h.until("Proxy利用可能")
+	awaitSessions(t, a, 2)
+	t.Cleanup(func() {
+		if h.m.pendingUpdate != nil {
+			h.m.pendingUpdate.Close()
+		}
+	})
+	h.key("ctrl+k")
+	h.key("update")
+	h.key("enter")
+	if h.m.state != "updateChecking" {
+		t.Fatal("更新を開始できない")
+	}
+	h.pumpUntil(func() bool { return h.m.state == "updateConfirm" }, "更新確認")
+	h.key("tab")
+	h.key("enter")
+	h.pumpUntil(func() bool {
+		select {
+		case <-started:
+			return true
+		default:
+			return false
+		}
+	}, "取得開始")
+	if rows, _ := a.Status(ctx); len(rows) != 2 {
+		t.Fatal("検証前に接続停止")
+	}
+	close(gate)
+	h.pumpUntil(func() bool { return h.m.exit }, "更新停止")
+	h.m.workers.Wait()
+	if rows, _ := a.Status(ctx); len(rows) != 0 {
+		t.Fatal("更新停止でProxy残留")
+	}
+	if rows, _ := external.Status(ctx); len(rows) != 1 {
+		t.Fatal("外部Proxyを停止")
+	}
+	awaitProxyPort(t, ext.Port)
+}
+
+// readyをUIへ配送しない境界から終了・取消・再試行しても準備結果を漏らさない。
+func TestConnectionsSelfUpdateDeliveryContract(t *testing.T) {
+	for _, mode := range []string{"undelivered-exit", "cancel-stale-retry"} {
+		t.Run(mode, func(t *testing.T) {
+			a, _, _ := testApp(t)
+			gate, _, _ := selfUpdateUIFixture(t, a)
+			close(gate)
+			h := newConnectionsHarness(t, a)
+			t.Cleanup(func() {
+				h.m.closeWork()
+				h.m.workers.Wait()
+				if h.m.updateJob != nil {
+					h.m.updateJob.closePrepared()
+				}
+				if h.m.pendingUpdate != nil {
+					h.m.pendingUpdate.Close()
+				}
+			})
+			open := func() {
+				h.key("ctrl+k")
+				h.key("update")
+				h.key("enter")
+				h.pumpUntil(func() bool { return h.m.state == "updateConfirm" }, "更新確認")
+				h.key("tab")
+				h.key("enter")
+			}
+			open()
+			var ready uiSelfUpdateResult
+			timeout := time.NewTimer(6 * time.Second)
+			defer timeout.Stop()
+		waitReady:
+			for {
+				select {
+				case msg := <-h.events:
+					if v, ok := msg.(uiSelfUpdateResult); ok && v.prepared != nil {
+						ready = v
+						break waitReady
+					}
+					h.update(msg)
+				case <-timeout.C:
+					t.Fatal("未配送ready待ちが完了しない")
+				}
+			}
+			h.m.workers.Wait()
+			lock := filepath.Join(a.Paths.ConfigDir, ".path-lock")
+			if _, err := os.Stat(lock); err != nil {
+				t.Fatal("配送前の準備が排他を所有していない", err)
+			}
+			stage := ready.prepared.StageDir
+			if mode == "undelivered-exit" {
+				h.key("ctrl+c")
+				h.m.workers.Wait()
+				// runConnectModelの終了待機後と同じ所有権の解放を通す。
+				h.m.updateJob.closePrepared()
+				h.update(ready)
+				if !h.m.exit || h.m.pendingUpdate != nil {
+					t.Fatal("遅い結果が更新終了へ変化")
+				}
+			} else {
+				h.key("esc")
+				h.update(ready)
+				if h.m.state != "list" || h.m.exit {
+					t.Fatal("取消後に一覧へ戻らない")
+				}
+				h.key("ctrl+k")
+				h.key("update")
+				h.key("enter")
+				h.update(ready) // 終了済みoperationが次の更新を上書きしない。
+				if h.m.state != "updateChecking" || h.m.exit {
+					t.Fatal("古いreadyが新しい操作を更新")
+				}
+				h.pumpUntil(func() bool { return h.m.state == "updateConfirm" }, "再試行の確認")
+				h.key("tab")
+				h.key("enter")
+				h.pumpUntil(func() bool { return h.m.exit }, "再試行ready")
+				if h.m.pendingUpdate == nil || h.m.pendingUpdate.StageDir == stage {
+					t.Fatal("再試行が古い準備を再利用")
+				}
+				h.m.pendingUpdate.Close()
+			}
+			if _, err := os.Stat(stage); !os.IsNotExist(err) {
+				t.Fatal("古いstagingが残留")
+			}
+			if _, err := os.Stat(lock); !os.IsNotExist(err) {
+				t.Fatal("更新ロックが残留")
+			}
+			target := filepath.Join(a.Paths.ConfigDir, "bin", "csql")
+			b, _ := os.ReadFile(target)
+			if string(b) != "previous csql binary" {
+				t.Fatal("取消/未配送の結果が配置を変更")
+			}
+		})
 	}
 }

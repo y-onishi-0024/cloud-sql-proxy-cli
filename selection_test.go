@@ -1,10 +1,15 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -94,6 +99,62 @@ func runUIFixture() int {
 	}
 
 	exe, _ := os.Executable()
+	// このfixtureだけで公開APIと管理領域を代替し、実インストール・外部HTTPへ触れない。
+	if os.Getenv("CSQL_TEST_UI_UPDATE") == "1" {
+		data, err := os.ReadFile(exe)
+		if err != nil {
+			fmt.Fprintln(a.Err, err)
+			return 1
+		}
+		sum := sha256.Sum256(data)
+		managed := filepath.Join(a.Paths.ConfigDir, "bin", "csql")
+		if a.OS == "windows" {
+			managed += ".exe"
+		}
+		if _, err := os.Stat(managed); os.IsNotExist(err) {
+			os.MkdirAll(filepath.Dir(managed), 0700)
+			os.WriteFile(managed, data, 0700)
+			writeJSON(filepath.Join(a.Paths.ConfigDir, "binary-install.json"), binaryReceipt{hex.EncodeToString(sum[:])})
+		}
+		a.Executable = func() (string, error) { return managed, nil }
+		os.Setenv("CSQL_TEST_SELF_UPDATE_VERSION", "0.8.0")
+		if os.Getenv("CSQL_TEST_UI_UPDATED") == "1" {
+			b, _ := json.Marshal(os.Args[1:])
+			os.WriteFile(filepath.Join(root, "updated-args.json"), b, 0600)
+		}
+		a.HTTP = &http.Client{Transport: updateTransport(func(r *http.Request) (*http.Response, error) {
+			payload := data
+			code := 200
+			if r.URL.Host == "api.github.com" {
+				tag := "v0.8.0"
+				if os.Getenv("CSQL_TEST_UI_UPDATED") == "1" {
+					tag = "v" + version
+				}
+				name := "csql-0.8.0-" + a.OS + "-" + a.Arch
+				if a.OS == "windows" {
+					name += ".exe"
+				}
+				payload, _ = json.Marshal(map[string]any{"tag_name": tag, "assets": []any{map[string]any{"name": name, "size": len(data), "state": "uploaded", "digest": "sha256:" + hex.EncodeToString(sum[:])}}})
+			} else {
+				os.WriteFile(filepath.Join(root, "update-download-started"), []byte("started"), 0600)
+				for {
+					if _, err := os.Stat(filepath.Join(root, "update-download-gate")); os.IsNotExist(err) {
+						break
+					}
+					select {
+					case <-r.Context().Done():
+						return nil, r.Context().Err()
+					case <-time.After(20 * time.Millisecond):
+					}
+				}
+				if _, err := os.Stat(filepath.Join(root, "update-fail")); err == nil {
+					code = 503
+				}
+			}
+			return &http.Response{StatusCode: code, Body: io.NopCloser(bytes.NewReader(payload)), ContentLength: int64(len(payload)), Header: make(http.Header)}, nil
+		})}
+		a.RestartSelf = func(path string) error { os.Setenv("CSQL_TEST_UI_UPDATED", "1"); return restartSelfUpdate(a, path) }
+	}
 	a.LookPath = func(name string) (string, error) {
 		if name == "gcloud" {
 			return "/fixture/gcloud", nil
@@ -639,7 +700,7 @@ func TestConnectUIExportUnsupportedTool(t *testing.T) {
 		p := Profile{Name: "dev", Instance: testInstance(), Database: tc.database, Username: "reader", Port: 55439}
 		p.DatabaseVersion = tc.version
 		c := &uiConnection{id: 1, attempt: 1, profile: p, running: true, progress: &connectionProgress{snapshot: connectionSnapshot{Session: SessionStatus{Port: p.Port}}}}
-		m := &connectUI{a: a, ctx: context.Background(), state: "connecting", selectedID: 1, connections: []*uiConnection{c}, selector: selector{width: 60, height: 16}, updateVersion: "v0.6.0"}
+		m := &connectUI{a: a, ctx: context.Background(), state: "connecting", selectedID: 1, connections: []*uiConnection{c}, selector: selector{width: 60, height: 16}, updateVersion: "v0.8.0"}
 		m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("e")})
 		for i := 0; i < tc.index; i++ {
 			m.Update(tea.KeyMsg{Type: tea.KeyDown})
