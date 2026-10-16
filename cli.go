@@ -187,7 +187,7 @@ func (a *App) Run(ctx context.Context, args []string) int {
 	connectFlags := func(c *cobra.Command) {
 		c.Flags().String("profile", "", "保存済みの接続設定名")
 		searchFlags(c)
-		c.Flags().IntP("port", "p", 0, "待受ポート（省略時はDB種別から選択）")
+		c.Flags().IntP("port", "p", 0, "待受ポート（保存済み設定がない場合はPostgreSQL 15432 / MySQL 13306 / SQL Server 11433から空きを選択）")
 		c.Flags().Bool("private-ip", false, "Private IPで接続")
 	}
 	root.Args = argCount(0, 1)

@@ -244,13 +244,14 @@ func choosePort(db string, explicit int) (int, error) {
 	attempts := 1
 	if explicit == 0 {
 		attempts = 21
+		// プロファイル保存時と同じく、ローカルDBの標準ポートを避ける。
 		switch {
 		case strings.HasPrefix(db, "POSTGRES"):
-			start = 5432
+			start = 15432
 		case strings.HasPrefix(db, "MYSQL"):
-			start = 3306
+			start = 13306
 		case strings.HasPrefix(db, "SQLSERVER"):
-			start = 1433
+			start = 11433
 		default:
 			return 0, fmt.Errorf("未知のDB種別です。--port を指定してください")
 		}

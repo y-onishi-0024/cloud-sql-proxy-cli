@@ -89,9 +89,43 @@ func TestProfileCLIAndExports(t *testing.T) {
 	}
 }
 
+// 標準ポートを避け、使用中・別インスタンスの予約済みポートも飛ばして保存候補を選ぶ。
+func TestProfileAutomaticPorts(t *testing.T) {
+	for _, tc := range []struct {
+		version string
+		base    int
+	}{
+		{"POSTGRES_18", 15432},
+		{"MYSQL_8_0", 13306},
+		{"SQLSERVER_2019_STANDARD", 11433},
+	} {
+		t.Run(tc.version, func(t *testing.T) {
+			a, _, _ := testApp(t)
+			busy, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", tc.base))
+			if err != nil {
+				t.Skipf("検証用ポート%dを確保できません: %v", tc.base, err)
+			}
+			defer busy.Close()
+			reserved := Profile{Name: "other", Instance: testInstance(), Database: "app", Username: "reader", Port: tc.base + 1}
+			reserved.Instance.Name = "other"
+			reserved.ConnectionName = "alpha:asia-northeast1:other"
+			if err := a.AddProfile(context.Background(), reserved); err != nil {
+				t.Fatal(err)
+			}
+			p := Profile{Name: "dev", Instance: testInstance(), Database: "app", Username: "reader"}
+			p.DatabaseVersion = tc.version
+			prepared, err := a.PrepareProfile(p)
+			if err != nil || prepared.Port < tc.base+2 || prepared.Port > tc.base+20 {
+				t.Fatalf("標準ポートを避けた空き・未予約の範囲%d〜%dから選択できない: %+v %v", tc.base+2, tc.base+20, prepared, err)
+			}
+		})
+	}
+}
+
 func TestProfilesPersistenceAndPortReuse(t *testing.T) {
 	a, _, _ := testApp(t)
-	p := Profile{Name: "dev", Instance: testInstance(), Database: "app", Username: "reader", Port: 55435}
+	// 旧デフォルトで保存した設定も、新しい自動割り当てへ変更しない。
+	p := Profile{Name: "dev", Instance: testInstance(), Database: "app", Username: "reader", Port: 5432}
 	if err := a.AddProfile(context.Background(), p); err != nil {
 		t.Fatal(err)
 	}
@@ -99,7 +133,7 @@ func TestProfilesPersistenceAndPortReuse(t *testing.T) {
 	p.Database = "reports"
 	p.Port = 0
 	prepared, err := a.PrepareProfile(p)
-	if err != nil || prepared.Port != 55435 {
+	if err != nil || prepared.Port != 5432 {
 		t.Fatalf("同一instanceのPortを喪失: %+v %v", prepared, err)
 	}
 	if err := a.AddProfile(context.Background(), prepared); err != nil {
