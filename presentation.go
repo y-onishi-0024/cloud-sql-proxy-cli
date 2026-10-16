@@ -13,11 +13,14 @@ type terminalView struct {
 	width, height int
 	color         bool
 	update        string
+	theme         uiTheme
 }
 type terminalChoice struct {
 	name, hint, summary string
 	details             []string
 	compact             []string
+	columns             []string
+	statusColor         string
 }
 type choiceView struct {
 	sideTitle                  string
@@ -26,14 +29,53 @@ type choiceView struct {
 	pos, cursor                int
 	rows                       []terminalChoice
 	footer                     []string
+	table                      bool
 }
 
-const (
-	tuiAccent  = "#78DCE8"
-	tuiMuted   = "#8995A8"
-	tuiSuccess = "#A9DC76"
-	tuiError   = "#FF6188"
-)
+// 色の指定がないautoでは端末の標準文字色を使い、入力への背景問い合わせを行わない。
+type uiTheme struct {
+	accent, muted, success, warning, failure string
+	selectionForeground, selectionBackground string
+}
+
+func parseUITheme(env func(string) string) (uiTheme, error) {
+	value, background := "", ""
+	if env != nil {
+		value = env("CSQL_THEME")
+		background = env("COLORFGBG")
+	}
+	switch value {
+	case "", "auto":
+		parts := strings.Split(background, ";")
+		switch parts[len(parts)-1] {
+		case "0", "8":
+			value = "dark"
+		case "7", "15":
+			value = "light"
+		default:
+			return uiTheme{}, nil
+		}
+	case "dark", "light":
+	default:
+		return uiTheme{}, fmt.Errorf("CSQL_THEMEはauto|dark|lightを指定してください（例: CSQL_THEME=auto csql）")
+	}
+	if value == "light" {
+		return uiTheme{accent: "#005A9C", muted: "#465364", success: "#176B32", warning: "#805400", failure: "#B42336", selectionForeground: "#102E46", selectionBackground: "#DCEAF4"}, nil
+	}
+	return uiTheme{accent: "#78DCE8", muted: "#A3AFBF", success: "#A9DC76", warning: "#FFD866", failure: "#FF6188", selectionForeground: "#EAF7FA", selectionBackground: "#244354"}, nil
+}
+func (v terminalView) selected(s string) string {
+	if !v.color {
+		return s
+	}
+	style := lipgloss.NewStyle()
+	if v.theme.selectionForeground == "" {
+		style = style.Reverse(true)
+	} else {
+		style = style.Foreground(lipgloss.Color(v.theme.selectionForeground)).Background(lipgloss.Color(v.theme.selectionBackground))
+	}
+	return style.Render(s)
+}
 
 func paddedLine(s string, width int) string {
 	s = ansi.Truncate(s, width, "…")
@@ -43,31 +85,26 @@ func paddedLine(s string, width int) string {
 func (v terminalView) panel(title string, lines []string, width, height int) string {
 	title = ansi.Truncate(title, max(0, width-6), "…")
 	top := "╭─ " + title + " " + strings.Repeat("─", max(0, width-ansi.StringWidth(title)-5)) + "╮"
-	result := []string{paint(top, tuiMuted, v.color)}
+	result := []string{paint(top, v.theme.muted, v.color)}
 	for i := 0; i < height-2; i++ {
 		line := ""
 		if i < len(lines) {
 			line = lines[i]
 		}
-		result = append(result, paint("│ ", tuiMuted, v.color)+paddedLine(line, width-4)+paint(" │", tuiMuted, v.color))
+		result = append(result, paint("│ ", v.theme.muted, v.color)+paddedLine(line, width-4)+paint(" │", v.theme.muted, v.color))
 	}
-	result = append(result, paint("╰"+strings.Repeat("─", max(0, width-2))+"╯", tuiMuted, v.color))
+	result = append(result, paint("╰"+strings.Repeat("─", max(0, width-2))+"╯", v.theme.muted, v.color))
 	return strings.Join(result, "\n")
 }
 
 // 操作ガイドの2行を先に確保し、長い本文やログで隠さない。
 func (v terminalView) frame(title, subtitle, badge, body string, footer []string) string {
-	heading := paint(" csql ", tuiAccent, v.color) + " " + title
+	heading := paint(" csql ", v.theme.accent, v.color) + " " + title
 	if v.update != "" {
-		// 既存のヘッダーだけを使い、最小画面でも本文と操作ガイドの高さを保つ。
-		heading = paint(" csql ", tuiAccent, v.color) + " 更新あり " + v.update
-		subtitle = updatePage
-		if ansi.StringWidth(subtitle) > v.width {
-			subtitle = strings.TrimPrefix(subtitle, "https://")
-		}
+		badge = paint("更新 "+v.update, v.theme.warning, v.color) + " · " + badge
 	}
-	room := v.width - ansi.StringWidth(badge) - 1
-	lines := []string{paddedLine(heading, max(0, room)) + " " + badge, ansi.Truncate(subtitle, v.width, "…")}
+	room := max(0, v.width-ansi.StringWidth(badge)-1)
+	lines := []string{paddedLine(heading, room) + " " + badge, ansi.Truncate(subtitle, v.width, "…")}
 	content := strings.Split(body, "\n")
 	for i := 0; i < v.height-4; i++ {
 		line := ""
@@ -81,7 +118,19 @@ func (v terminalView) frame(title, subtitle, badge, body string, footer []string
 		if i < len(footer) {
 			line = footer[i]
 		}
-		lines = append(lines, paint(ansi.Truncate(line, v.width, "…"), tuiMuted, v.color))
+		if i == 0 {
+			line = "F1 ヘルプ  " + line
+		} else {
+			ending := "Ctrl+C 終了"
+			if strings.Contains(line, "全接続") {
+				ending = "Ctrl+C 全接続停止"
+			}
+			if at := strings.Index(line, "Ctrl+C"); at >= 0 {
+				line = strings.TrimSpace(line[:at])
+			}
+			line = paddedLine(line, max(0, v.width-ansi.StringWidth(ending)-2)) + "  " + ending
+		}
+		lines = append(lines, paint(ansi.Truncate(line, v.width, "…"), v.theme.muted, v.color))
 	}
 	return fitScreen(strings.Join(lines, "\n"), v.width, v.height)
 }
@@ -93,7 +142,7 @@ func (v terminalView) choices(c choiceView) string {
 	if wide {
 		leftWidth = v.width - max(34, v.width/3) - 1
 	}
-	lines := []string{"検索  " + inputView(c.query, c.pos, leftWidth-10), paint(fmt.Sprintf("%d 件  ·  ↑↓で選択", len(c.rows)), tuiMuted, v.color), ""}
+	lines := []string{"検索  " + inputView(c.query, c.pos, leftWidth-10), paint(fmt.Sprintf("%d 件  ·  ↑↓で選択", len(c.rows)), v.theme.muted, v.color), ""}
 	reserve := 2
 	if c.cursor >= 0 && c.cursor < len(c.rows) && len(c.rows[c.cursor].compact) > 0 {
 		reserve = len(c.rows[c.cursor].compact)
@@ -103,21 +152,37 @@ func (v terminalView) choices(c choiceView) string {
 	} else if len(c.sideLines) > 0 {
 		reserve = min(6, max(2, bodyHeight-7))
 	}
-	limit := max(1, (bodyHeight-2-len(lines)-reserve)/2)
+	rowHeight := 2
+	var widths []int
+	if wide && c.table {
+		rowHeight = 1
+		remaining := leftWidth - 6 - 18
+		nameWidth, projectWidth := remaining*4/10, remaining*35/100
+		widths = []int{8, nameWidth, projectWidth, 6, remaining - nameWidth - projectWidth}
+		lines[len(lines)-1] = "  " + tableLine([]string{"状態", "設定・接続先", "プロジェクト", "Port", "DB"}, widths)
+	}
+	limit := max(1, (bodyHeight-2-len(lines)-reserve)/rowHeight)
 	start := max(0, c.cursor-limit+1)
 	for i := start; i < len(c.rows) && i < start+limit; i++ {
 		row := c.rows[i]
 		name := "  " + row.name
 		hint := "  " + row.hint
-		if i == c.cursor {
-			name = "› " + row.name
-			if v.color {
-				style := lipgloss.NewStyle().Foreground(lipgloss.Color("#EAF7FA")).Background(lipgloss.Color("#244354"))
-				name = style.Render(paddedLine(name, leftWidth-4))
-				hint = style.Render(paddedLine(hint, leftWidth-4))
+		if wide && c.table {
+			name = "  " + tableLine(row.columns, widths)
+			if i == c.cursor {
+				name = "› " + tableLine(row.columns, widths)
+				name = v.selected(paddedLine(name, leftWidth-4))
+			} else if row.statusColor != "" {
+				name = paint(name, row.statusColor, v.color)
 			}
+			lines = append(lines, name)
+			continue
+		}
+		if i == c.cursor {
+			name = v.selected(paddedLine("› "+row.name, leftWidth-4))
+			hint = v.selected(paddedLine(hint, leftWidth-4))
 		} else {
-			hint = paint(hint, tuiMuted, v.color)
+			hint = paint(hint, v.theme.muted, v.color)
 		}
 		lines = append(lines, name, hint)
 	}
@@ -137,7 +202,7 @@ func (v terminalView) choices(c choiceView) string {
 				lines = append(lines, "")
 			}
 			for _, line := range compact {
-				lines = append(lines, paint(line, tuiAccent, v.color))
+				lines = append(lines, paint(line, v.theme.accent, v.color))
 			}
 		}
 	}
@@ -167,9 +232,22 @@ func (v terminalView) choices(c choiceView) string {
 		}
 		body = strings.Join(left, "\n")
 	}
-	badge := paint("● 選択", tuiAccent, v.color)
+	badge := paint("● 選択", v.theme.accent, v.color)
 	if c.notice != "" {
-		badge = paint(c.notice, tuiError, v.color)
+		badge = paint(c.notice, v.theme.failure, v.color)
 	}
-	return v.frame("CLOUD SQL", c.tabs, badge, body, c.footer)
+	return v.frame(c.title, c.tabs, badge, body, c.footer)
+}
+
+// 見出しと値に同じセル幅を使い、日本語で列がずれないようにする。
+func tableLine(values []string, widths []int) string {
+	var cells []string
+	for i, width := range widths {
+		value := ""
+		if i < len(values) {
+			value = cleanText(values[i])
+		}
+		cells = append(cells, paddedLine(value, width))
+	}
+	return strings.Join(cells, " ")
 }

@@ -12,8 +12,10 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
 	"github.com/charmbracelet/x/term"
+	"github.com/muesli/termenv"
 )
 
 func TestSelectorEditingAndResize(t *testing.T) {
@@ -80,6 +82,17 @@ func runUIFixture() int {
 	a := NewApp()
 	root := os.Getenv("CSQL_TEST_UI_DIR")
 	a.Paths = Paths{filepath.Join(root, "config"), filepath.Join(root, "cache"), filepath.Join(root, "tools")}
+	// PTYでも利用者の実クリップボードへ触れず、コピー結果を一時領域で観測する。
+	a.CopyText = func(ctx context.Context, text string) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if _, err := os.Stat(filepath.Join(root, "copy-fail")); err == nil {
+			return fmt.Errorf("fixture copy failure")
+		}
+		return os.WriteFile(filepath.Join(root, "copied.txt"), []byte(text), 0600)
+	}
+
 	exe, _ := os.Executable()
 	a.LookPath = func(name string) (string, error) {
 		if name == "gcloud" {
@@ -644,6 +657,73 @@ func TestConnectUIExportUnsupportedTool(t *testing.T) {
 		m.Update(tea.KeyMsg{Type: tea.KeyEnter})
 		if m.state != "export" || m.exportFormat != "dbeaver" || !c.running {
 			t.Fatal("別の形式を選び直せない")
+		}
+	}
+}
+
+// テーマによって判別できる内容やセル幅が変わらず、明暗と無色を選べる。
+func TestRichDashboardThemes(t *testing.T) {
+	old := lipgloss.ColorProfile()
+	lipgloss.SetColorProfile(termenv.TrueColor)
+	t.Cleanup(func() { lipgloss.SetColorProfile(old) })
+	rendered := map[string]string{}
+	for _, tc := range []struct{ name, theme, bg, noColor string }{{"auto", "auto", "", ""}, {"dark", "dark", "", ""}, {"light", "light", "", ""}, {"auto-dark", "auto", "15;0", ""}, {"auto-light", "auto", "0;15", ""}, {"no-color", "dark", "", "1"}} {
+		a, _, _ := testApp(t)
+		a.Env = func(key string) string {
+			switch key {
+			case "CSQL_THEME":
+				return tc.theme
+			case "COLORFGBG":
+				return tc.bg
+			case "NO_COLOR":
+				return tc.noColor
+			}
+			return ""
+		}
+		theme, err := parseUITheme(a.Env)
+		if err != nil {
+			t.Fatal(err)
+		}
+		p := Profile{Name: strings.Repeat("日本語", 20), Instance: testInstance(), Database: "orders", Port: 55441}
+		m := &connectUI{a: a, ctx: context.Background(), state: "list", tab: tabConnections, connections: []*uiConnection{{id: 1, attempt: 1, profile: p}}, selector: selector{width: 100, height: 20, color: tc.noColor == "", theme: theme}}
+		view := m.View()
+		rendered[tc.name] = view
+		if tc.noColor != "" && strings.Contains(view, "\x1b[") {
+			t.Fatal("NO_COLORで色/反転が残った")
+		}
+		if !strings.Contains(view, "55441") || !strings.Contains(view, "Ctrl+C") {
+			t.Fatal("テーマで情報を喪失")
+		}
+		for _, line := range strings.Split(ansi.Strip(view), "\n") {
+			if ansi.StringWidth(line) > 100 {
+				t.Fatal("テーマでセル幅を超えた")
+			}
+		}
+	}
+	if rendered["auto"] == rendered["dark"] || rendered["dark"] == rendered["light"] || rendered["auto-dark"] != rendered["dark"] || rendered["auto-light"] != rendered["light"] {
+		t.Fatal("背景に対応するテーマが選択されない")
+	}
+	// 不正値は対話開始前に案内し、補助コマンドを巻き込まない。
+	for _, args := range [][]string{{}, {"version"}, {"--help"}} {
+		a, out, errs := testApp(t)
+		a.TTY = true
+		a.Env = func(key string) string {
+			if key == "CSQL_THEME" {
+				return "invalid"
+			}
+			return ""
+		}
+		a.Runner = runnerFunc(func(context.Context, Executable, []string) ([]byte, error) {
+			t.Error("テーマ検証で外部実行")
+			return nil, fmt.Errorf("禁止")
+		})
+		code := a.Run(context.Background(), args)
+		if len(args) == 0 {
+			if code == 0 || !strings.Contains(errs.String(), "auto|dark|light") {
+				t.Fatalf("不正値の案内なし: %s", errs)
+			}
+		} else if code != 0 || out.Len() == 0 {
+			t.Fatal("非対話コマンドへ影響")
 		}
 	}
 }

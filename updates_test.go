@@ -64,8 +64,11 @@ func TestStartupUpdateNoticeCache(t *testing.T) {
 		m := updateModel(t, a)
 		deliverStartup(m)
 		view := m.View()
-		if !strings.Contains(view, "v0.10.0") || !strings.Contains(view, "github.com/y-onishi-0024/cloud-sql-proxy-cli/releases/latest") || strings.Contains(view, "untrusted.invalid") {
+		if !strings.Contains(view, "v0.10.0") || strings.Contains(view, "untrusted.invalid") {
 			t.Fatal("新版と固定の更新先が案内されない: ", view)
+		}
+		if !strings.Contains(readUIHelp(m), updatePage) {
+			t.Fatal("F1に固定更新先がない")
 		}
 		now = now.Add(23 * time.Hour)
 	}
@@ -288,7 +291,7 @@ func TestStartupUpdateNoticeLayouts(t *testing.T) {
 			m.state = state
 			m.fields = []formField{{label: "設定名", value: "dev"}}
 			view := ansi.Strip(m.View())
-			if !strings.Contains(view, "v0.11.0") || !strings.Contains(view, "github.com/y-onishi-0024/cloud-sql-proxy-cli/releases/latest") || !strings.Contains(view, "Ctrl+C") {
+			if !strings.Contains(view, "v0.11.0") || !strings.Contains(view, "Ctrl+C") || !strings.Contains(view, "保存済み設定") {
 				t.Fatalf("%dx%d %sで更新先または終了案内が消える: %s", size[0], size[1], state, view)
 			}
 			lines := strings.Split(view, "\n")
