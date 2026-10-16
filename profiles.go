@@ -254,14 +254,15 @@ func availableProfilePort(v Instance, explicit int, rows []Profile, unavailable 
 		}
 		return choosePort(v.DatabaseVersion, explicit)
 	}
+	// ローカルDBの標準ポートを避けて自動割り当てを始める。
 	base := 0
 	switch {
 	case strings.HasPrefix(v.DatabaseVersion, "POSTGRES"):
-		base = 5432
+		base = 15432
 	case strings.HasPrefix(v.DatabaseVersion, "MYSQL"):
-		base = 3306
+		base = 13306
 	case strings.HasPrefix(v.DatabaseVersion, "SQLSERVER"):
-		base = 1433
+		base = 11433
 	default:
 		return 0, fmt.Errorf("未知のDB種別です。--port を指定してください")
 	}

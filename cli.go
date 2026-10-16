@@ -80,7 +80,7 @@ func NewApp() *App {
 	return &App{Paths: Paths{filepath.Join(c, "csql"), filepath.Join(cache, "csql"), filepath.Join(c, "csql", "tools")}, In: os.Stdin, Out: os.Stdout, Err: os.Stderr, TTY: term.IsTerminal(os.Stdin.Fd()) && term.IsTerminal(os.Stdout.Fd()), OS: runtime.GOOS, Arch: runtime.GOARCH, Runner: osRunner{}, LookPath: exec.LookPath, Env: os.Getenv, Now: time.Now, QueryTimeout: 60 * time.Second, CheckTimeout: 10 * time.Second, StopGrace: 10 * time.Second, StartupTimeout: 60 * time.Second}
 }
 
-const version = "0.4.0"
+const version = "0.4.1"
 
 var ErrCancelled = errors.New("操作を取り消しました")
 
@@ -187,7 +187,7 @@ func (a *App) Run(ctx context.Context, args []string) int {
 	connectFlags := func(c *cobra.Command) {
 		c.Flags().String("profile", "", "保存済みの接続設定名")
 		searchFlags(c)
-		c.Flags().IntP("port", "p", 0, "待受ポート（省略時はDB種別から選択）")
+		c.Flags().IntP("port", "p", 0, "待受ポート（保存済み設定がない場合はPostgreSQL 15432 / MySQL 13306 / SQL Server 11433から空きを選択）")
 		c.Flags().Bool("private-ip", false, "Private IPで接続")
 	}
 	root.Args = argCount(0, 1)
