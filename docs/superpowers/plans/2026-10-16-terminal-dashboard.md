@@ -92,13 +92,13 @@ focused: `go test -race ./... -run 'TestSelector|TestSelection|TestConnectUI|Tes
 
 ## 段階3: 独立レビュー・最終検証
 
-- [ ] 候補SHAとclean状態を固定し、履歴なしの独立Reviewer1名へ設計・計画・base/candidate・focused結果を渡す。全差分と5つの重点条件、認証案内・副作用・入力/終了境界を監査する。必要な修正は同じ実装担当が行い、同じReviewerが候補全体を再確認する。
-- [ ] 候補に対し`go test -race ./... -count=1 -timeout=90s`、`go test -race -tags installer ./... -run 'TestInstaller|TestSetupPathCLI' -count=1`、`go vet ./...`、`go vet -tags installer ./...`、gofmt、`git diff --check`を実行する。
-- [ ] 同候補からCLI5環境（darwin/arm64・amd64、linux/arm64・amd64、windows/amd64）をCGO_ENABLED=0、`-trimpath -buildvcs=false`でビルドする。`python3 scripts/build-installers.py`でMac2版・Windows版の同梱CLI/manifestと署名・構造を確認する。過去の版別releaseを保持する。
-- [ ] 既存`.superpowers/sdd/2026-10-16-connection-workspace/verify-release-pty.py`を参考に、今回用のPTY手順を除外済みの作業ディレクトリへ作る。実クリップボードを使わないよう、既存runUIFixtureへ偽コピー入口を追加する。製品用の待機フックは増やさない。
-- [ ] auto（COLORFGBG未設定）・light・NO_COLORの3条件で、複数接続→表と狭幅→日本語検索/消去→検索付き操作の確定/取消→F1と背景結果→認証エラーの偽コピー/失敗/再試行→4形式出力→保存→停止後ポート変更→再接続→Ctrl+Cを確認する。darkと既知背景autoはfocused描画テストで確認する。別端末の接続維持と代替画面の復元も観測する。
-- [ ] 同一候補SHA、argv、Go版、GOCACHE/GOMODCACHE、結果、設計への適合と未確認範囲を`.superpowers/sdd/2026-10-16-terminal-dashboard/`へ記録する。新しい変更・失敗・懸念がなければ成功済みgateを繰り返さない。
-- [ ] 実DB接続、DBツールGUI取込、Windows実機のSet-Clipboard/セットアップ操作を未確認として区別する。製品の受入条件と工程の完了を分け、公開・端末更新済みとは報告しない。
+- [x] 候補SHAとclean状態を固定し、履歴なしの独立Reviewer1名へ設計・計画・base/candidate・focused結果を渡す。全差分と5つの重点条件、認証案内・副作用・入力/終了境界を監査する。必要な修正は同じ実装担当が行い、同じReviewerが候補全体を再確認する。
+- [x] 候補に対し`go test -race ./... -count=1 -timeout=90s`、`go test -race -tags installer ./... -run 'TestInstaller|TestSetupPathCLI' -count=1`、`go vet ./...`、`go vet -tags installer ./...`、gofmt、`git diff --check`を実行する。
+- [x] 同候補からCLI5環境（darwin/arm64・amd64、linux/arm64・amd64、windows/amd64）をCGO_ENABLED=0、`-trimpath -buildvcs=false`でビルドする。`python3 scripts/build-installers.py`でMac2版・Windows版の同梱CLI/manifestと署名・構造を確認する。過去の版別releaseを保持する。
+- [x] 既存`.superpowers/sdd/2026-10-16-connection-workspace/verify-release-pty.py`を参考に、今回用のPTY手順を除外済みの作業ディレクトリへ作る。実クリップボードを使わないよう、既存runUIFixtureへ偽コピー入口を追加する。製品用の待機フックは増やさない。
+- [x] auto（COLORFGBG未設定）・light・NO_COLORの3条件で、複数接続→表と狭幅→日本語検索/消去→検索付き操作の確定/取消→F1と背景結果→認証エラーの偽コピー/失敗/再試行→4形式出力→保存→停止後ポート変更→再接続→Ctrl+Cを確認する。darkと既知背景autoはfocused描画テストで確認する。別端末の接続維持と代替画面の復元も観測する。
+- [x] 同一候補SHA、argv、Go版、GOCACHE/GOMODCACHE、結果、設計への適合と未確認範囲を`.superpowers/sdd/2026-10-16-terminal-dashboard/`へ記録する。新しい変更・失敗・懸念がなければ成功済みgateを繰り返さない。
+- [x] 実DB接続、DBツールGUI取込、Windows実機のSet-Clipboard/セットアップ操作を未確認として区別する。製品の受入条件と工程の完了を分け、公開・端末更新済みとは報告しない。
 
 ## 実行方法と停止条件
 
