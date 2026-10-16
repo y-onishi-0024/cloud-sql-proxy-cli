@@ -61,14 +61,14 @@
 対象: updates.go、selfupdate.go、selfupdate_test.go。
 成果: 正しい正式版の通常CLIだけを取得・検証し、準備完了/取消を返せる。
 
-- [ ] `TestSelfUpdateReleaseContract`をtableで追加する。正式新版のasset選択、同版/旧版の無変更、draft/prerelease/不正tag、欠落/重複asset、digest/サイズ不正、未対応OSを確認する。`CSQL_NO_UPDATE_CHECK=1`でも明示取得は可能とし、既存通知cacheへ依存しない。
-- [ ] 上記testを実行して、機能未実装による期待するREDを確認する。既存`TestStartupUpdate*`の成功を基準証拠として残す。コンパイル用の型だけが必要なら足場を置き、意味のある振る舞いの失敗まで確認する。
-- [ ] `fetchSelfUpdate`を実装する。既存parseReleaseVersion/newerReleaseを利用し、canonicalなv付きtagと完全一致assetを検証する。固定APIはredirect禁止、Cookie/authなし。API bodyは256KiB+1を読み上限超過を拒否する。明示取得失敗は通知処理のように黙殺しない。
-- [ ] `TestSelfUpdatePreparation`に偽RoundTripper/配布物で、成功、Content-Length不整合/途中切断、容量超過、ハッシュ不一致、取消、HTTP、未知ホストへのredirect、間違ったOS/CPU/GUI/版をまとめる。不正ハッシュ・形式のファイルを起動しないことを観測する。
-- [ ] `inspectSelfUpdateTarget`と`prepareSelfUpdate`を実装する。実行中パス・managed bin・binary-install.json・経路のリンク拒否を既存pathRead/pathNoLinksの契約で検査し、専用一時dirを0700で作る。現行Google専用downloadは変更しない。
-- [ ] 取得URLは`https://github.com/y-onishi-0024/cloud-sql-proxy-cli/releases/download/<Tag>/<Name>`、redirect上限3回、https/通常443・userinfoなし、hostはgithub.com/release-assets.githubusercontent.comだけを許可する。metadataの任意URLは使わず、公開配布に不要なCookie/Authorizationを転送しない。署名付きredirectのqueryや完全URLをエラーへ出さない。
-- [ ] 受信中にAPIサイズ超過を検出し、終了時にサイズとSHA-256を照合する。形式確認は標準debugパッケージで行い、その後だけversionを実行する。version検査は5秒+WaitDelay200ms、出力上限16KiB、stdinなし、正確な`csql <期待版>`を要求する。接続/gcloud Runnerとは分け、実行引数へ外部文字列を埋め込まない。
-- [ ] 準備/取得の失敗・取消では作成したstagingだけを削除する。通知用API/キャッシュは既存の挙動を保つ。focused `go test -race ./... -run 'TestSelfUpdateReleaseContract|TestSelfUpdatePreparation|TestStartupUpdate' -count=1`がPASSしたら関連変更を1コミットにまとめる。
+- [x] `TestSelfUpdateReleaseContract`をtableで追加する。正式新版のasset選択、同版/旧版の無変更、draft/prerelease/不正tag、欠落/重複asset、digest/サイズ不正、未対応OSを確認する。`CSQL_NO_UPDATE_CHECK=1`でも明示取得は可能とし、既存通知cacheへ依存しない。
+- [x] 上記testを実行して、機能未実装による期待するREDを確認する。既存`TestStartupUpdate*`の成功を基準証拠として残す。コンパイル用の型だけが必要なら足場を置き、意味のある振る舞いの失敗まで確認する。
+- [x] `fetchSelfUpdate`を実装する。既存parseReleaseVersion/newerReleaseを利用し、canonicalなv付きtagと完全一致assetを検証する。固定APIはredirect禁止、Cookie/authなし。API bodyは256KiB+1を読み上限超過を拒否する。明示取得失敗は通知処理のように黙殺しない。
+- [x] `TestSelfUpdatePreparation`に偽RoundTripper/配布物で、成功、Content-Length不整合/途中切断、容量超過、ハッシュ不一致、取消、HTTP、未知ホストへのredirect、間違ったOS/CPU/GUI/版をまとめる。不正ハッシュ・形式のファイルを起動しないことを観測する。
+- [x] `inspectSelfUpdateTarget`と`prepareSelfUpdate`を実装する。実行中パス・managed bin・binary-install.json・経路のリンク拒否を既存pathRead/pathNoLinksの契約で検査し、専用一時dirを0700で作る。現行Google専用downloadは変更しない。
+- [x] 取得URLは`https://github.com/y-onishi-0024/cloud-sql-proxy-cli/releases/download/<Tag>/<Name>`、redirect上限3回、https/通常443・userinfoなし、hostはgithub.com/release-assets.githubusercontent.comだけを許可する。metadataの任意URLは使わず、公開配布に不要なCookie/Authorizationを転送しない。署名付きredirectのqueryや完全URLをエラーへ出さない。
+- [x] 受信中にAPIサイズ超過を検出し、終了時にサイズとSHA-256を照合する。形式確認は標準debugパッケージで行い、その後だけversionを実行する。version検査は5秒+WaitDelay200ms、出力上限16KiB、stdinなし、正確な`csql <期待版>`を要求する。接続/gcloud Runnerとは分け、実行引数へ外部文字列を埋め込まない。
+- [x] 準備/取得の失敗・取消では作成したstagingだけを削除する。通知用API/キャッシュは既存の挙動を保つ。focused `go test -race ./... -run 'TestSelfUpdateReleaseContract|TestSelfUpdatePreparation|TestStartupUpdate' -count=1`がPASSしたら関連変更を1コミットにまとめる。
 
 ## 段階2: 配置・復元・単独コマンド
 

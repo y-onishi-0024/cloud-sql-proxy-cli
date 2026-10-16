@@ -24,6 +24,10 @@ import (
 )
 
 func TestMain(m *testing.M) {
+	if v := os.Getenv("CSQL_TEST_SELF_UPDATE_VERSION"); v != "" && len(os.Args) == 2 && os.Args[1] == "version" {
+		fmt.Fprintln(os.Stdout, "csql "+v)
+		os.Exit(0)
+	}
 	if os.Getenv("CSQL_TEST_CLIPBOARD") != "" {
 		os.Exit(runClipboardFixture())
 	}
