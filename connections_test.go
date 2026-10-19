@@ -428,7 +428,7 @@ func TestConnectionsAddSwitchAndStop(t *testing.T) {
 		awaitProxyPort(t, row.Port)
 	}
 	h.key("esc")
-	h.m.updateVersion = "v0.9.0"
+	h.m.updateVersion = "v0.10.0"
 	if !strings.Contains(h.m.View(), "稼働 2件") {
 		t.Fatal("更新通知で稼働件数を喪失")
 	}
@@ -1182,7 +1182,7 @@ func TestConnectionsSelfUpdate(t *testing.T) {
 				t.Fatal("検索0件の共通更新が開かない", h.m.state)
 			}
 			h.pumpUntil(func() bool { return h.m.state == "updateConfirm" }, "更新確認")
-			if !strings.Contains(h.m.View(), "0.9.0") {
+			if !strings.Contains(h.m.View(), "0.10.0") {
 				t.Fatal("版の確認がない")
 			}
 			if mode == "decline" {
@@ -1670,5 +1670,126 @@ func TestConnectionsMigrationLive(t *testing.T) {
 	}
 	if rows, _ := external.Status(context.Background()); len(rows) != 1 {
 		t.Fatal("Ctrl+Cが外部に波及")
+	}
+}
+
+// 起点の検索・選択を保ち、既定取消と一覧からの登録を確認する。
+func TestConnectionsDBToolRegistration(t *testing.T) {
+	a, p, exe, w := dbToolFixture(t)
+	h := newConnectionsHarness(t, a)
+	m := h.m
+	m.tab = tabProfiles
+	m.profiles = []Profile{p}
+	m.selector.query = "dev"
+	m.selector.inputPos = 3
+	h.key("ctrl+k")
+	h.key("register")
+	h.key("enter")
+	if m.state != "registrationTools" {
+		t.Fatalf("入口: %s %s", m.state, m.message)
+	}
+	h.key("down")
+	h.key("enter")
+	m.fields[0].value = exe
+	m.fields[1].value = w
+	m.focus = 1
+	h.key("enter")
+	h.pumpUntil(func() bool { return m.state == "registrationConfirm" }, "登録前確認")
+	h.key("enter")
+	if m.state != "list" || m.tab != tabProfiles || m.selector.query != "dev" {
+		t.Fatalf("取消後の一覧 %+v", m)
+	}
+	files, _ := filepath.Glob(filepath.Join(w, "General/.dbeaver/data-sources-csql-*.json"))
+	if len(files) != 0 {
+		t.Fatal("既定取消で書込み")
+	}
+	h.key("ctrl+k")
+	h.key("register")
+	h.key("enter")
+	h.key("down")
+	h.key("enter")
+	m.fields[0].value = exe
+	m.fields[1].value = w
+	m.focus = 1
+	h.key("enter")
+	h.pumpUntil(func() bool { return m.state == "registrationConfirm" }, "登録前確認")
+	h.key("tab")
+	h.key("enter")
+	h.pumpUntil(func() bool { return m.state == "registrationResult" }, "登録結果")
+	if !strings.Contains(m.registrationReport, "追加JSONを保存") {
+		t.Fatal(m.registrationReport)
+	}
+	for _, size := range [][2]int{{60, 16}, {100, 30}} {
+		m.selector.width, m.selector.height = size[0], size[1]
+		view := m.View()
+		if !strings.Contains(view, "登録結果") {
+			t.Fatal("結果画面を表示できない")
+		}
+	}
+	h.key("enter")
+	if m.state != "list" || m.selector.query != "dev" {
+		t.Fatal("登録後の起点を失った")
+	}
+}
+
+// 画面終了でCmdが配送されなくても、確定した外部副作用はjobが保持する。
+func TestConnectionsDBToolRegistrationDelivery(t *testing.T) {
+	a, p, exe, w := dbToolFixture(t)
+	h := newConnectionsHarness(t, a)
+	m := h.m
+	m.tab = tabProfiles
+	m.profiles = []Profile{p}
+	m.openActions()
+	m.editProfile = p
+	m.startDBToolRegistration()
+	plan, err := a.planDBToolRegistration(h.ctx, p, dbToolOptions{Tool: "dbeaver", Executable: exe, DBeaverWorkspace: w})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := m.dbToolRegistrationWork("apply", func(ctx context.Context) uiDBToolRegistrationResult {
+		r, e := a.applyDBToolRegistration(ctx, plan)
+		return uiDBToolRegistrationResult{result: r, err: e}
+	})
+	// Bubble Teaへ配送する前に終了させる。
+	msg := cmd()
+	m.beginShutdown()
+	job := m.registrationJobs[len(m.registrationJobs)-1]
+	job.mu.Lock()
+	finished := job.finished
+	displayed := job.displayed
+	job.mu.Unlock()
+	if finished == nil || !finished.result.Committed || displayed {
+		t.Fatalf("未配送結果を失った %+v", finished)
+	}
+	m.Update(msg)
+	if m.state != "stopping" {
+		t.Fatal("遅延結果が終了画面を書き換えた")
+	}
+}
+
+func TestConnectionsDBToolRegistrationSmallTerminal(t *testing.T) {
+	a, p, exe, w := dbToolFixture(t)
+	h := newConnectionsHarness(t, a)
+	m := h.m
+	m.tab = tabProfiles
+	m.profiles = []Profile{p}
+	m.openActions()
+	m.editProfile = p
+	m.startDBToolRegistration()
+	plan, err := a.planDBToolRegistration(h.ctx, p, dbToolOptions{Tool: "dbeaver", Executable: exe, DBeaverWorkspace: w})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.registrationPlan = plan
+	m.state = "registrationConfirm"
+	h.update(tea.WindowSizeMsg{Width: 59, Height: 15})
+	h.key("tab")
+	h.key("enter")
+	if m.registrationYes || m.registrationJob != nil || m.state != "registrationConfirm" {
+		t.Fatal("確認内容が隠れたまま登録を開始")
+	}
+	h.key("esc")
+	if m.state != "registrationForm" {
+		t.Fatal("小さい画面で取消できない")
 	}
 }

@@ -27,8 +27,8 @@ func TestSelfUpdateReleaseContract(t *testing.T) {
 		t.Run(mode, func(t *testing.T) {
 			a, _, _ := testApp(t)
 			a.OS, a.Arch = "darwin", "arm64"
-			asset := map[string]any{"name": "csql-0.9.0-darwin-arm64", "size": 123, "state": "uploaded", "digest": "sha256:" + strings.Repeat("a", 64), "browser_download_url": "https://untrusted.invalid/payload"}
-			release := map[string]any{"tag_name": "v0.9.0", "assets": []any{asset}}
+			asset := map[string]any{"name": "csql-0.10.0-darwin-arm64", "size": 123, "state": "uploaded", "digest": "sha256:" + strings.Repeat("a", 64), "browser_download_url": "https://untrusted.invalid/payload"}
+			release := map[string]any{"tag_name": "v0.10.0", "assets": []any{asset}}
 			switch mode {
 			case "same":
 				release["tag_name"] = "v" + version
@@ -39,7 +39,7 @@ func TestSelfUpdateReleaseContract(t *testing.T) {
 			case "prerelease":
 				release["prerelease"] = true
 			case "tag":
-				release["tag_name"] = "v0.9.0\x1b"
+				release["tag_name"] = "v0.10.0\x1b"
 			case "missing":
 				release["assets"] = []any{}
 			case "duplicate":
@@ -70,7 +70,7 @@ func TestSelfUpdateReleaseContract(t *testing.T) {
 			got, err := a.fetchSelfUpdate(context.Background())
 			switch mode {
 			case "new":
-				if err != nil || got == nil || got.Name != asset["name"] || got.URL != "https://github.com/y-onishi-0024/cloud-sql-proxy-cli/releases/download/v0.9.0/csql-0.9.0-darwin-arm64" {
+				if err != nil || got == nil || got.Name != asset["name"] || got.URL != "https://github.com/y-onishi-0024/cloud-sql-proxy-cli/releases/download/v0.10.0/csql-0.10.0-darwin-arm64" {
 					t.Fatalf("公式新版を選べない: %+v %v", got, err)
 				}
 			case "same", "older":
@@ -124,9 +124,9 @@ func TestSelfUpdatePreparation(t *testing.T) {
 			a, _, _ := testApp(t)
 			a.OS, a.Arch = runtime.GOOS, runtime.GOARCH
 			target := selfUpdateTestTarget(t, a)
-			t.Setenv("CSQL_TEST_SELF_UPDATE_VERSION", "0.9.0")
+			t.Setenv("CSQL_TEST_SELF_UPDATE_VERSION", "0.10.0")
 			if mode == "version" {
-				t.Setenv("CSQL_TEST_SELF_UPDATE_VERSION", "0.10.0")
+				t.Setenv("CSQL_TEST_SELF_UPDATE_VERSION", "0.11.0")
 			}
 			data := binary
 			if mode == "format" {
@@ -137,7 +137,7 @@ func TestSelfUpdatePreparation(t *testing.T) {
 			if mode == "hash" {
 				digest = strings.Repeat("0", 64)
 			}
-			offer := selfUpdateOffer{Tag: "v0.9.0", Name: "csql-0.9.0-" + a.OS + "-" + a.Arch, URL: "https://github.com/y-onishi-0024/cloud-sql-proxy-cli/releases/download/v0.9.0/payload", SHA256: digest, Size: int64(len(data))}
+			offer := selfUpdateOffer{Tag: "v0.10.0", Name: "csql-0.10.0-" + a.OS + "-" + a.Arch, URL: "https://github.com/y-onishi-0024/cloud-sql-proxy-cli/releases/download/v0.10.0/payload", SHA256: digest, Size: int64(len(data))}
 			if mode == "cpu" {
 				if a.Arch == "arm64" {
 					a.Arch = "amd64"
@@ -213,8 +213,8 @@ func selfUpdatePrepared(t *testing.T, a *App) *preparedSelfUpdate {
 		t.Fatal(err)
 	}
 	sum := sha256.Sum256(data)
-	offer := selfUpdateOffer{Tag: "v0.9.0", Name: "payload", URL: "https://github.com/y-onishi-0024/cloud-sql-proxy-cli/releases/download/v0.9.0/payload", SHA256: hex.EncodeToString(sum[:]), Size: int64(len(data))}
-	t.Setenv("CSQL_TEST_SELF_UPDATE_VERSION", "0.9.0")
+	offer := selfUpdateOffer{Tag: "v0.10.0", Name: "payload", URL: "https://github.com/y-onishi-0024/cloud-sql-proxy-cli/releases/download/v0.10.0/payload", SHA256: hex.EncodeToString(sum[:]), Size: int64(len(data))}
+	t.Setenv("CSQL_TEST_SELF_UPDATE_VERSION", "0.10.0")
 	a.HTTP = &http.Client{Transport: updateTransport(func(r *http.Request) (*http.Response, error) {
 		return &http.Response{StatusCode: 200, Body: io.NopCloser(bytes.NewReader(data)), ContentLength: int64(len(data)), Header: make(http.Header)}, nil
 	})}
@@ -302,7 +302,7 @@ func TestSelfUpdateApplyContract(t *testing.T) {
 				},
 			}
 			if mode == "version" {
-				t.Setenv("CSQL_TEST_SELF_UPDATE_VERSION", "0.10.0")
+				t.Setenv("CSQL_TEST_SELF_UPDATE_VERSION", "0.11.0")
 			}
 			err := a.applySelfUpdate(context.Background(), p)
 			if mode == "ok" {
@@ -376,8 +376,8 @@ func TestSelfUpdateCLI(t *testing.T) {
 			exe, _ := os.Executable()
 			data, _ := os.ReadFile(exe)
 			sum := sha256.Sum256(data)
-			asset := map[string]any{"name": "csql-0.9.0-" + a.OS + "-" + a.Arch, "size": len(data), "state": "uploaded", "digest": "sha256:" + hex.EncodeToString(sum[:])}
-			release := map[string]any{"tag_name": "v0.9.0", "assets": []any{asset}}
+			asset := map[string]any{"name": "csql-0.10.0-" + a.OS + "-" + a.Arch, "size": len(data), "state": "uploaded", "digest": "sha256:" + hex.EncodeToString(sum[:])}
+			release := map[string]any{"tag_name": "v0.10.0", "assets": []any{asset}}
 			if mode == "latest" {
 				release["tag_name"] = "v" + version
 			}
@@ -412,7 +412,7 @@ func TestSelfUpdateCLI(t *testing.T) {
 			code := a.Run(ctx, args)
 			switch mode {
 			case "yes":
-				if code != 0 || !strings.Contains(out.String(), "0.9.0") {
+				if code != 0 || !strings.Contains(out.String(), "0.10.0") {
 					t.Fatal("更新できない", code, out)
 				}
 			case "decline", "latest", "help":
@@ -449,8 +449,8 @@ func selfUpdateUIFixture(t *testing.T, a *App) (chan struct{}, chan struct{}, *a
 	exe, _ := os.Executable()
 	data, _ := os.ReadFile(exe)
 	sum := sha256.Sum256(data)
-	asset := map[string]any{"name": "csql-0.9.0-" + a.OS + "-" + a.Arch, "size": len(data), "state": "uploaded", "digest": "sha256:" + hex.EncodeToString(sum[:])}
-	body, _ := json.Marshal(map[string]any{"tag_name": "v0.9.0", "assets": []any{asset}})
+	asset := map[string]any{"name": "csql-0.10.0-" + a.OS + "-" + a.Arch, "size": len(data), "state": "uploaded", "digest": "sha256:" + hex.EncodeToString(sum[:])}
+	body, _ := json.Marshal(map[string]any{"tag_name": "v0.10.0", "assets": []any{asset}})
 	gate, started := make(chan struct{}), make(chan struct{})
 	var startedOnce sync.Once
 	fail := &atomic.Bool{}

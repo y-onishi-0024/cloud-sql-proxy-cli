@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	tea "github.com/charmbracelet/bubbletea"
@@ -253,6 +254,17 @@ type listLocation struct {
 	connectionID     uint64
 }
 type connectUI struct {
+	registrationJob                      *uiDBToolRegistrationJob
+	registrationJobs                     []*uiDBToolRegistrationJob
+	registrationPlan                     *dbToolRegistrationPlan
+	registrationOrigin                   *actionContext
+	registrationProfile                  Profile
+	registrationTool                     string
+	registrationOperation                uint64
+	registrationCursor, registrationPage int
+	registrationYes                      bool
+	registrationReport                   string
+
 	a                                    *App
 	ctx                                  context.Context
 	request                              connectRequest
@@ -339,6 +351,9 @@ func (m *connectUI) closeWork() {
 	m.workMu.Lock()
 	m.workClosed = true
 	m.workMu.Unlock()
+	if m.registrationJob != nil {
+		m.registrationJob.cancel()
+	}
 	if m.migrationJob != nil {
 		m.migrationJob.cancel()
 	}
@@ -638,6 +653,23 @@ func (m *connectUI) availableActions() []uiAction {
 			add("refresh", "一覧を再取得", "refresh 再検索", "")
 		}
 	}
+	if !m.addOnly && (b.location.tab == tabProfiles || b.location.tab == tabConnections) {
+		reason := "先に接続設定を保存してください"
+		if _, ok := m.savedDBToolProfile(b.profile); ok {
+			reason = ""
+		}
+		if b.location.tab == tabConnections {
+			c := m.connection(b.owner)
+			if c == nil {
+				reason = "接続先を選択してください"
+			} else if c.stopping {
+				reason = "停止完了を待機"
+			} else if c.running && (c.progress == nil || c.progress.Snapshot().Session.Port == 0) {
+				reason = "Portの確定を待機"
+			}
+		}
+		add("register", "ツールへ直接登録", "register import pgadmin dbeaver a5 登録", reason)
+	}
 	if b.diagnostic != nil {
 		for _, cmd := range b.diagnostic.Commands {
 			reason := ""
@@ -813,6 +845,8 @@ func (m *connectUI) executeAction(action uiAction) tea.Cmd {
 		return m.search()
 	case "save":
 		m.openForm(b.profile)
+	case "register":
+		return m.startDBToolRegistration()
 	case "export":
 		m.openExportMenu()
 	case "port":
@@ -839,9 +873,11 @@ func (m *connectUI) executeAction(action uiAction) tea.Cmd {
 	return nil
 }
 func (m *connectUI) openHelp() {
-	screen := map[string]string{"list": "一覧", "actions": "操作メニュー", "form": "接続設定の保存", "portForm": "ポート変更", "export": "出力先の入力", "exportTools": "出力ツールの選択", "error": "エラーと対処", "saving": "保存処理中", "searching": "インスタンス検索", "stopping": "終了処理中", "connecting": "接続情報", "updateChecking": "更新情報の確認", "updateConfirm": "csql更新の確認", "updatePreparing": "更新の取得と検証", "updateCancelling": "更新の取消", "migrationPath": "移行ファイルのパス", "migrationPreparing": "移行内容の確認", "migrationConfirm": "取込の実行前確認", "migrationApplying": "移行ファイルの保存", "migrationCancelling": "移行処理の取消"}[m.state]
+	screen := map[string]string{"registrationTools": "登録先ツール", "registrationForm": "登録先入力", "registrationPreparing": "登録先の検査", "registrationConfirm": "登録前確認", "registrationApplying": "直接登録", "registrationCancelling": "登録結果の確認", "registrationResult": "登録結果", "list": "一覧", "actions": "操作メニュー", "form": "接続設定の保存", "portForm": "ポート変更", "export": "出力先の入力", "exportTools": "出力ツールの選択", "error": "エラーと対処", "saving": "保存処理中", "searching": "インスタンス検索", "stopping": "終了処理中", "connecting": "接続情報", "updateChecking": "更新情報の確認", "updateConfirm": "csql更新の確認", "updatePreparing": "更新の取得と検証", "updateCancelling": "更新の取消", "migrationPath": "移行ファイルのパス", "migrationPreparing": "移行内容の確認", "migrationConfirm": "取込の実行前確認", "migrationApplying": "移行ファイルの保存", "migrationCancelling": "移行処理の取消"}[m.state]
 	lines := []string{"現在の画面: " + screen}
 	switch m.state {
+	case "registrationTools", "registrationForm", "registrationPreparing", "registrationConfirm", "registrationApplying", "registrationCancelling", "registrationResult":
+		lines = append(lines, "↑↓/Tab 選択・項目移動  Enter 次へ/確認", "確認は既定で取消。PgUp/PgDn 詳細", "Esc 戻る/取消要求（要求済みなら結果を確認）", "登録ではProxyを停止しません。Ctrl+Cは全接続停止")
 	case "updateChecking", "updateConfirm", "updatePreparing", "updateCancelling":
 		lines = append(lines, "Esc 取消（準備完了前のみ）", "確認後、検証を完了してから自画面の接続を停止", "PgUp/PgDn 詳細  Ctrl+C 全接続停止", "更新後は一覧へ戻り、DBへの再接続は手動です")
 	case "actions":
@@ -1244,6 +1280,8 @@ func (m *connectUI) beginExport(format string) {
 }
 func (m *connectUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch v := msg.(type) {
+	case uiDBToolRegistrationResult:
+		return m, m.finishDBToolRegistration(v)
 	case uiMigrationResult:
 		return m, m.finishMigration(v)
 	case uiSelfUpdateResult:
@@ -1462,6 +1500,12 @@ func (m *connectUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if key != "pgup" && key != "pgdown" {
 			m.interaction++
+		}
+		if strings.HasPrefix(m.state, "registration") {
+			if m.selector.width > 0 && (m.selector.width < 60 || m.selector.height < 16) && key != "esc" {
+				return m, nil
+			}
+			return m, m.dbToolRegistrationKey(v)
 		}
 		if strings.HasPrefix(m.state, "update") {
 			return m, m.selfUpdateKey(key)
@@ -1805,6 +1849,9 @@ func (m *connectUI) View() string {
 		page := min(m.help.page, last)
 		start := page * pageHeight
 		return v.frame("操作ヘルプ", tabs, "ヘルプ", v.panel("操作ヘルプ", rows[start:min(len(rows), start+pageHeight)], width, height-4), []string{fmt.Sprintf("PgUp/PgDn %d/%d  F1/Esc 閉じる", page+1, last+1), "Ctrl+C 全接続停止"})
+	}
+	if strings.HasPrefix(m.state, "registration") {
+		return m.dbToolRegistrationView(v, width, height, tabs)
 	}
 	if strings.HasPrefix(m.state, "update") {
 		return m.selfUpdateView(v, width, height, tabs)
@@ -2151,6 +2198,15 @@ func (a *App) runConnectModel(ctx context.Context, request connectRequest, seed 
 		job.mu.Unlock()
 		if result != nil && !displayed && (result.result.Committed || result.result.Backup != "") {
 			fmt.Fprintln(a.stdout(), a.migrationResultText(m.migrationKind, result.result, result.err))
+		}
+	}
+	for _, job := range m.registrationJobs {
+		job.mu.Lock()
+		result := job.finished
+		displayed := job.displayed
+		job.mu.Unlock()
+		if result != nil && !displayed && (result.result.Committed || result.result.Submitted || result.result.Backup != "") {
+			fmt.Fprintln(a.stdout(), dbToolResultText(result.result, result.err))
 		}
 	}
 	if m.updateJob != nil {
@@ -2734,4 +2790,296 @@ func (m *connectUI) migrationView(v terminalView, width, height int, tabs string
 	start := page * size
 	footer := []string{fmt.Sprintf("Enter 確認/実行  Tab 取消/取込  PgUp/PgDn %d/%d", page+1, last+1), "Esc 戻る/取消  F1 ヘルプ  Ctrl+C 全接続停止"}
 	return v.frame(title, tabs, badge, v.panel(title, wrapped[start:min(len(wrapped), start+size)], width, height-4), footer)
+}
+
+// 同時接続の実効Portと保存設定が一致する行だけを直接登録の対象にする。
+func (m *connectUI) savedDBToolProfile(p Profile) (Profile, bool) {
+	for _, saved := range m.profiles {
+		if saved.ConnectionName == p.ConnectionName && saved.Database == p.Database && saved.Username == p.Username && saved.Port == p.Port && (p.Name == "" || p.Name == saved.Name) {
+			return saved, true
+		}
+	}
+	return Profile{}, false
+}
+
+type uiDBToolRegistrationJob struct {
+	operation uint64
+	phase     string
+	cancel    context.CancelFunc
+	mu        sync.Mutex
+	finished  *uiDBToolRegistrationResult
+	displayed bool
+}
+type uiDBToolRegistrationResult struct {
+	operation uint64
+	job       *uiDBToolRegistrationJob
+	plan      *dbToolRegistrationPlan
+	result    dbToolRegistrationResult
+	err       error
+}
+
+func (m *connectUI) startDBToolRegistration() tea.Cmd {
+	if m.exit || m.registrationJob != nil {
+		return nil
+	}
+	p, ok := m.savedDBToolProfile(m.editProfile)
+	if !ok {
+		m.message = "先に設定を保存してください"
+		return nil
+	}
+	m.registrationProfile = p
+	m.registrationOrigin = m.actionOrigin
+	m.registrationPlan = nil
+	m.registrationCursor, m.registrationPage = 0, 0
+	m.registrationYes = false
+	m.message = ""
+	m.state = "registrationTools"
+	return nil
+}
+func (m *connectUI) restoreDBToolRegistration(message string) {
+	m.actionOrigin = m.registrationOrigin
+	m.restoreActionOrigin()
+	m.registrationJob = nil
+	m.registrationPlan = nil
+	m.registrationOrigin = nil
+	m.registrationPage = 0
+	m.message = message
+}
+func (m *connectUI) dbToolRegistrationWork(phase string, run func(context.Context) uiDBToolRegistrationResult) tea.Cmd {
+	m.registrationOperation++
+	ctx, cancel := context.WithCancel(m.ctx)
+	job := &uiDBToolRegistrationJob{operation: m.registrationOperation, phase: phase, cancel: cancel}
+	m.registrationJob = job
+	m.registrationJobs = append(m.registrationJobs, job)
+	cancelled := uiDBToolRegistrationResult{operation: job.operation, job: job, err: context.Canceled}
+	return m.work(ctx, cancelled, func() tea.Msg {
+		result := run(ctx)
+		result.operation, result.job = job.operation, job
+		job.mu.Lock()
+		job.finished = &result
+		job.mu.Unlock()
+		return result
+	})
+}
+func (m *connectUI) finishDBToolRegistration(v uiDBToolRegistrationResult) tea.Cmd {
+	if m.exit || v.operation != m.registrationOperation || v.job != m.registrationJob {
+		return nil
+	}
+	m.registrationJob = nil
+	if v.job.phase == "preview" && v.err == nil && m.state != "registrationCancelling" {
+		m.registrationPlan = v.plan
+		m.registrationYes = false
+		m.registrationPage = 0
+		m.state = "registrationConfirm"
+		return nil
+	}
+	if v.job.phase == "preview" {
+		if m.state == "registrationCancelling" {
+			m.restoreDBToolRegistration("登録を取り消しました")
+			return nil
+		}
+		m.state = "registrationForm"
+		m.message = safeLog(v.err.Error())
+		return nil
+	}
+	m.registrationReport = dbToolResultText(v.result, v.err)
+	m.registrationPage = 0
+	m.state = "registrationResult"
+	return nil
+}
+func (m *connectUI) dbToolRegistrationKey(key tea.KeyMsg) tea.Cmd {
+	k := key.String()
+	switch k {
+	case "pgup":
+		m.registrationPage = max(0, m.registrationPage-1)
+		return nil
+	case "pgdown":
+		m.registrationPage++
+		return nil
+	case "esc":
+		if m.registrationJob != nil {
+			m.registrationJob.cancel()
+			m.state = "registrationCancelling"
+			return nil
+		}
+		if m.state == "registrationConfirm" {
+			m.state = "registrationForm"
+			m.message = ""
+			m.registrationPage = 0
+			return nil
+		}
+		m.restoreDBToolRegistration("")
+		return nil
+	}
+	if m.registrationJob != nil {
+		return nil
+	}
+	switch m.state {
+	case "registrationTools":
+		switch k {
+		case "down", "tab":
+			m.registrationCursor = (m.registrationCursor + 1) % 3
+		case "up":
+			m.registrationCursor = (m.registrationCursor + 2) % 3
+		case "enter":
+			tool := []string{"pgadmin", "dbeaver", "a5"}[m.registrationCursor]
+			if tool == "a5" && (m.a.OS != "windows" || m.a.Arch != "amd64") {
+				m.message = "A5直接登録はWindows amd64が対象です。Escで戻り、エクスポートからA5形式を出力できます"
+				return nil
+			}
+			m.registrationTool = tool
+			var opts dbToolOptions
+			// 端末固有の前回入力だけを再利用し、検出や外部起動はworkerへ渡す。
+			if b, _, err := pathRead(filepath.Join(m.a.Paths.ConfigDir, "db-tools.json"), profileLimit); err == nil {
+				if json.Unmarshal(b, &opts) != nil || opts.Tool != tool {
+					opts = dbToolOptions{}
+				}
+			}
+			m.fields = []formField{{label: "実行ファイル（pgAdminはインストールフォルダー / 空欄は検出）", value: opts.Executable}}
+			if tool == "pgadmin" {
+				m.fields = append(m.fields, formField{label: "pgAdmin設定DB（空欄は標準配置）", value: opts.PGAdminSQLite}, formField{label: "pgAdmin所有ユーザー（空欄はdesktop既定）", value: opts.PGAdminUser})
+			}
+			if tool == "dbeaver" {
+				m.fields = append(m.fields, formField{label: "workspace（Generalへ追加 / 空欄は標準配置）", value: opts.DBeaverWorkspace})
+			}
+			for i := range m.fields {
+				m.fields[i].pos = len([]rune(m.fields[i].value))
+			}
+			m.focus = 0
+			m.message = ""
+			m.state = "registrationForm"
+		}
+	case "registrationForm":
+		switch k {
+		case "tab", "down":
+			m.focus = (m.focus + 1) % len(m.fields)
+		case "shift+tab", "up":
+			m.focus = (m.focus + len(m.fields) - 1) % len(m.fields)
+		case "enter":
+			if m.focus < len(m.fields)-1 {
+				m.focus++
+				return nil
+			}
+			if !m.actionValid(m.registrationOrigin, false) {
+				m.message = "対象が更新されました。Escで戻り、選び直してください"
+				return nil
+			}
+			o := dbToolOptions{Tool: m.registrationTool, Executable: m.fields[0].value}
+			if o.Tool == "pgadmin" {
+				o.PGAdminSQLite, o.PGAdminUser = m.fields[1].value, m.fields[2].value
+			}
+			if o.Tool == "dbeaver" {
+				o.DBeaverWorkspace = m.fields[1].value
+			}
+			a, p := m.a, m.registrationProfile
+			m.state = "registrationPreparing"
+			m.message = ""
+			return m.dbToolRegistrationWork("preview", func(ctx context.Context) uiDBToolRegistrationResult {
+				plan, err := a.planDBToolRegistration(ctx, p, o)
+				return uiDBToolRegistrationResult{plan: plan, err: err}
+			})
+		default:
+			editText(&m.fields[m.focus].value, &m.fields[m.focus].pos, key)
+		}
+	case "registrationConfirm":
+		plan := m.registrationPlan
+		if plan == nil {
+			return nil
+		}
+		if k == "tab" || k == "left" || k == "right" || k == "up" || k == "down" {
+			if plan.Disposition != "conflict" {
+				m.registrationYes = !m.registrationYes
+			}
+			return nil
+		}
+		if k == "enter" {
+			if !m.registrationYes {
+				m.restoreDBToolRegistration("登録を取り消しました")
+				return nil
+			}
+			if plan.Disposition == "conflict" {
+				return nil
+			}
+			if !m.actionValid(m.registrationOrigin, false) {
+				m.message = "対象が更新されました。Escで戻り、選び直してください"
+				return nil
+			}
+			a := m.a
+			m.state = "registrationApplying"
+			m.message = ""
+			return m.dbToolRegistrationWork("apply", func(ctx context.Context) uiDBToolRegistrationResult {
+				result, err := a.applyDBToolRegistration(ctx, plan)
+				return uiDBToolRegistrationResult{result: result, err: err}
+			})
+		}
+	case "registrationResult":
+		if k == "enter" {
+			m.restoreDBToolRegistration(m.registrationReport)
+		}
+	}
+	return nil
+}
+func (m *connectUI) dbToolRegistrationView(v terminalView, width, height int, tabs string) string {
+	title := "ツールへ直接登録"
+	badge := "準備"
+	lines := []string{"処理を確認しています。Proxy接続は維持しています"}
+	switch m.state {
+	case "registrationTools":
+		badge = "ツール選択"
+		lines = []string{"保存済み設定: " + m.registrationProfile.Name, ""}
+		for i, name := range []string{"pgAdmin", "DBeaver Community", "A5（Windows amd64）"} {
+			prefix := "  "
+			if i == m.registrationCursor {
+				prefix = "> "
+			}
+			lines = append(lines, prefix+name)
+		}
+	case "registrationForm":
+		badge = "登録先入力"
+		lines = []string{"対象: " + m.registrationTool, "対象ツールを終了してから登録してください。パスワードは渡しません。", ""}
+		// 小さい端末でも編集中の項目を必ず表示する。
+		f := m.fields[m.focus]
+		lines = append(lines, fmt.Sprintf("項目 %d/%d: %s", m.focus+1, len(m.fields), f.label), inputView(f.value, f.pos, width-8), "Enter 次の項目 / 最後の項目で内容を確認")
+	case "registrationConfirm":
+		badge = "実行前確認"
+		choice := "[取消]   登録する"
+		if m.registrationYes {
+			choice = "取消   [登録する]"
+		}
+		if m.registrationPlan.Disposition == "conflict" {
+			choice = "競合のため登録できません（Escで戻る）"
+		}
+		lines = []string{choice, "", m.a.dbToolPlanText(m.registrationPlan)}
+	case "registrationApplying":
+		badge = "登録中"
+		lines = []string{"バックアップ・追加・照合を実行しています。", "Escは取消要求です。要求後は結果未確認になる場合があります。"}
+	case "registrationCancelling":
+		badge = "結果を確認中"
+		lines = []string{"取消要求を送りました。確定済みの保存・要求結果を待っています。"}
+	case "registrationResult":
+		badge = "登録結果"
+		lines = []string{m.registrationReport}
+	}
+	if m.message != "" {
+		lines = append(lines, "", m.message)
+	}
+	var wrapped []string
+	for _, line := range lines {
+		wrapped = append(wrapped, strings.Split(ansi.Wrap(safeLog(line), width-4, ""), "\n")...)
+	}
+	size := max(1, height-6)
+	last := max(0, (len(wrapped)-1)/size)
+	page := min(m.registrationPage, last)
+	start := page * size
+	// 結果全体を見ていなくても、確定済み副作用が画面へ出た事実を記録する。
+	if m.state == "registrationResult" {
+		for _, job := range m.registrationJobs {
+			if job.phase == "apply" && job.operation == m.registrationOperation {
+				job.mu.Lock()
+				job.displayed = true
+				job.mu.Unlock()
+			}
+		}
+	}
+	return v.frame(title, tabs, badge, v.panel(title, wrapped[start:min(len(wrapped), start+size)], width, height-4), []string{fmt.Sprintf("Enter 確定  Tab 選択/項目  PgUp/PgDn %d/%d", page+1, last+1), "Esc 戻る/取消  F1 ヘルプ  Ctrl+C 全接続停止"})
 }
