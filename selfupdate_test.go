@@ -126,7 +126,7 @@ func TestSelfUpdatePreparation(t *testing.T) {
 			target := selfUpdateTestTarget(t, a)
 			t.Setenv("CSQL_TEST_SELF_UPDATE_VERSION", "0.9.0")
 			if mode == "version" {
-				t.Setenv("CSQL_TEST_SELF_UPDATE_VERSION", "0.9.0")
+				t.Setenv("CSQL_TEST_SELF_UPDATE_VERSION", "0.10.0")
 			}
 			data := binary
 			if mode == "format" {
@@ -302,7 +302,7 @@ func TestSelfUpdateApplyContract(t *testing.T) {
 				},
 			}
 			if mode == "version" {
-				t.Setenv("CSQL_TEST_SELF_UPDATE_VERSION", "0.9.0")
+				t.Setenv("CSQL_TEST_SELF_UPDATE_VERSION", "0.10.0")
 			}
 			err := a.applySelfUpdate(context.Background(), p)
 			if mode == "ok" {
