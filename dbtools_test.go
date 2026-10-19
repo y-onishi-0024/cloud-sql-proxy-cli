@@ -30,7 +30,7 @@ func dbToolFixture(t *testing.T) (*App, Profile, string, string) {
 	if err := os.MkdirAll(filepath.Dir(product), 0700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(product, []byte("name=DBeaver\nid=org.jkiss.dbeaver.core.product\nversion=26.2.3\n"), 0600); err != nil {
+	if err := os.WriteFile(product, []byte("name=DBeaver\nid=org.jkiss.dbeaver.product\nversion=26.2.3\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
 	workspace := filepath.Join(root, "workspace6")
@@ -323,5 +323,22 @@ func TestDBToolRegistrationPGAdminNative(t *testing.T) {
 	r, err = a.applyDBToolRegistration(context.Background(), plan)
 	if err == nil || r.Status != "conflict" || r.Submitted {
 		t.Fatalf("同名の異なるPortを追加 %+v %v", r, err)
+	}
+}
+
+// 実配布パッケージの静的メタデータと、検出契約の食い違いを確認する。
+func TestDBToolRegistrationDBeaverPackage(t *testing.T) {
+	root := os.Getenv("CSQL_TEST_DBEAVER_ROOT")
+	if root == "" {
+		t.Skip("実配布パッケージの照合は明示指定時のみ")
+	}
+	a, p, _, workspace := dbToolFixture(t)
+	plan, err := a.planDBToolRegistration(context.Background(), p, dbToolOptions{Tool: "dbeaver", Executable: root, DBeaverWorkspace: workspace})
+	if err != nil || plan.Target.Version != "26.2.3" || plan.Disposition != "add" {
+		t.Fatalf("実パッケージを検出できない %+v %v", plan, err)
+	}
+	result, err := a.applyDBToolRegistration(context.Background(), plan)
+	if err != nil || !result.Committed || result.Verified {
+		t.Fatalf("保存とGUI確認を混同 %+v %v", result, err)
 	}
 }

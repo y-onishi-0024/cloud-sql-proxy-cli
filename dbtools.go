@@ -140,7 +140,7 @@ func (a *App) detectDBTool(o dbToolOptions) (dbToolTarget, error) {
 			root = filepath.Join(filepath.Dir(root), "Eclipse")
 		}
 		product, _, e := pathRead(filepath.Join(root, ".eclipseproduct"), 64<<10)
-		if e != nil || !bytes.Contains(product, []byte("id=org.jkiss.dbeaver.core.product")) {
+		if e != nil || !bytes.Contains(product, []byte("id=org.jkiss.dbeaver.product")) {
 			return t, fmt.Errorf("DBeaver Communityの標準配置を確認できません。Portable・Store・PRO版は対象外です")
 		}
 		versionRE := regexp.MustCompile(`(?m)^version=([^\r\n]+)`)
