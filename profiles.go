@@ -448,27 +448,12 @@ func profileExport(p Profile, format string) ([]byte, error) {
 		}
 		return data.Bytes(), nil
 	case "a5":
-		// 接続文字列の区切りや引用の意味を持つ値は、別プロパティとして解釈させない。
-		if strings.ContainsAny(p.Database+p.Username, ";\"") {
-			return nil, fmt.Errorf("A5形式ではDB名・ユーザー名にセミコロンや二重引用符を含められません。DBeaver形式またはURIを使用してください")
+		name, conn, err := a5Connection(p)
+		if err != nil {
+			return nil, err
 		}
-		provider := ""
-		switch {
-		case strings.HasPrefix(p.DatabaseVersion, "POSTGRES"):
-			provider = "PostgreSQL"
-		case strings.HasPrefix(p.DatabaseVersion, "MYSQL"):
-			provider = "MySQL"
-		case strings.HasPrefix(p.DatabaseVersion, "SQLSERVER"):
-			provider = "SQL Server"
-		default:
-			return nil, fmt.Errorf("このDB種別のA5出力は未対応です")
-		}
-		// BOMで文字コードを明示し、日本語もWindowsの既定ANSIへ依存させない。
-		data := fmt.Sprintf("\ufeffcsql/%s/%s=__ConnectionType=Internal;ProviderName=%s;ServerName=127.0.0.1;Port=%d;Database=%s;UserName=%s;", p.Project, p.Name, provider, p.Port, p.Database, p.Username)
-		if provider == "PostgreSQL" {
-			data += "ProtocolVersion=30;SSLMode=Disable;"
-		}
-		return []byte(data + "\r\n"), nil
+		// BOMと改行を含む従来の出力形式を維持する。
+		return []byte("\ufeff" + name + "=" + conn + "\r\n"), nil
 	case "uri":
 		scheme := ""
 		switch {
@@ -657,6 +642,6 @@ func (a *App) profileCommand() *cobra.Command {
 	}}
 	export.Flags().String("format", "", "出力形式（pgadmin|dbeaver|a5|uri）")
 	export.Flags().String("output", "", "新規出力ファイル（省略時は標準出力）")
-	root.AddCommand(add, list, remove, export, update)
+	root.AddCommand(add, list, remove, export, update, a.profileRegisterCommand())
 	return root
 }

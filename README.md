@@ -196,6 +196,38 @@ csql connect --profile dev
 対話端末では不足項目をフォームへ入力できます。自動選択したポートは保存前に表示するので、確認してEnter/Ctrl+Sで保存してください。非対話環境では必須値をすべて指定します。`--profile`はインスタンス名・`--project`・`--refresh`・`--private-ip`と併用できません。
 同じインスタンスの別DB・別ユーザーの設定は同じポートを共有し、別インスタンスへ同じポートを予約しません。設定はPCごとに保存されます。パスワードはDBツール側で管理してください。
 
+### DBツールへ直接登録
+
+保存済み設定の一覧、または接続一覧で **Ctrl+K → ツールへ直接登録** を選ぶと、対象ツール・配置・登録先・登録内容を確認して追加できます。先に対象ツールを終了してください。Proxy接続は維持し、DBへのログインは開始しません。未保存の接続は先に保存してください。
+
+```sh
+csql profile register dev --tool pgadmin --dry-run
+csql profile register dev --tool pgadmin
+csql profile register dev --tool dbeaver --dbeaver-workspace /path/to/workspace6
+# Windows amd64の通常版A5
+csql profile register dev --tool a5 --executable 'C:\Tools\A5M2\A5M2.exe'
+```
+
+`--dry-run` は外部プロセスもファイル書込みも行いません。実登録は対話端末で、既定を取消とする確認後に実行します。`--executable` はpgAdminではインストールフォルダー、他のツールでは実行ファイルを指定します。候補が複数・未検出の場合は明示してください。
+
+| ツール | 登録先・方式 | 互換性と確認状況 |
+| --- | --- | --- |
+| pgAdminデスクトップ | macOS `~/.pgadmin/pgadmin4.db`、Windows `%APPDATA%\pgAdmin\pgadmin4.db`。同梱Pythonによる公式 `load-servers` | 9.18 / schema 52。macOSでは一時DBで追加・重複防止・既存保持を実測。Windows実機は未確認 |
+| DBeaver Community | macOS `~/Library/DBeaverData/workspace6`、Windows `%APPDATA%\DBeaverData\workspace6` の `General/.dbeaver/data-sources-csql-<ID>.json` を新規保存 | 26.2.3の公式形式・parserに対応。保存とJSON照合を確認。実アプリでの読込み・再起動保持は別途確認が必要 |
+| A5:SQL Mk-2 | Windows amd64通常モードのHKCU `Software\mmatsubara\A5M2(x64)\DataSources`、公式 `/AddDB` | Windows実機での保存形式・`/Exit`・永続化は未確認。判別できない保存形式は書込み前に拒否 |
+
+pgAdminの保存先・所有ユーザーは `--pgadmin-sqlite` / `--pgadmin-user`、DBeaverは `--dbeaver-workspace` で変更できます。pgAdminのスキーマと重複検査は確認後に行うため、dry-runでは「確認後に検査」と表示します。未初期化・独自設定・対応外の版では、従来のファイル出力を利用してください。A5のPortable・Store・workspaceモード、pgAdminのDocker/Web版、DBeaver PRO、Linuxの直接登録は対象外です。
+
+同じ登録名と接続内容がある場合は追加しません。内容が異なる場合やユーザー名を照合できない場合は競合として止めます。保存済みPortを変更した後も、既存のDBツール設定は自動上書きしません。ツール側でPortを変更するか、別の保存名を使用してください。パスワードは登録しません。
+
+DBeaverでは既存JSONや暗号化資格情報を編集・復号せず、専用JSONだけを追加します。「追加JSONを保存」はファイルの確定を意味します。次回起動時にGeneralプロジェクトで名前・Host・Port・DB・Userを確認してください。ツールの起動やDB接続は自動実行しません。
+
+バックアップはcsql設定ディレクトリの `db-tool-backups/<tool>/<日時と一意ID>/`、登録履歴は `db-tool-registrations.json`、直前の登録先入力は `db-tools.json` に保存します。これら端末固有のデータはPC移行へ含めません。一時領域はcsqlキャッシュの `db-tool-register/` で、処理終了時に削除します。バックアップは元の資格情報を含み得るため共有しないでください。
+
+要求後のタイムアウト・取消では「結果未確認」と表示し、自動再送しません。ツール側で登録有無と重複を確認してください。自動復元もしません。画面終了と登録確定が重なった場合も、結果とバックアップ先を端末へ出力します。
+
+Windows実機などの確認は [検証手順](docs/db-tool-registration-verification.md) を参照してください。既存のエクスポートは引き続き利用できます。
+
 ### pgAdminデスクトップ版
 
 ```sh

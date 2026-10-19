@@ -56,6 +56,8 @@ type App struct {
 	SelfUpdateOps                         *selfUpdateFileOps
 	MigrationOps                          *migrationFileOps
 	RestartSelf                           func(string) error
+	DBToolRunning                         func(context.Context, dbToolTarget) (bool, error)
+	DBToolRun                             func(context.Context, string, []string) ([]byte, error)
 }
 type synchronizedWriter struct {
 	writer io.Writer

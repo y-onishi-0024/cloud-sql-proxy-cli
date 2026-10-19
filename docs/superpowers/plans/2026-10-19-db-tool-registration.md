@@ -1,6 +1,6 @@
 # DBツールへの接続設定直接登録の実装計画案
 
-> 実装担当への指示: 利用者による設計・計画・実行範囲の承認後に `superpowers:executing-plans` を使い、このチャットで直列実装する構成を推奨する。チェック項目を追跡し、状態/外部契約の設計変更は親へ戻す。現在は計画作成のみの依頼であり、実装は未承認。
+> 実装担当への指示: 利用者による設計・計画・実行範囲の承認後に `superpowers:executing-plans` を使い、このチャットで直列実装する構成を推奨する。チェック項目を追跡し、状態/外部契約の設計変更は親へ戻す。2026-10-19に実装承認済み。DBeaver追加JSON方式への補正も同日に承認済み。
 
 **目標:** 保存済み接続設定を、パスワードやDB接続の開始を伴わずpgAdmin・DBeaver・A5へ追加する。
 
@@ -8,7 +8,7 @@
 
 **技術:** Go 1.26.9、Cobra、Bubble Tea、標準API、既存golang.org/x/sys。pgAdminは同梱Pythonを使用する。新しいGo依存やツールの自動インストールは予定しない。
 
-**設計案:** [直接登録の設計](../specs/2026-10-19-db-tool-registration-design.md)。未承認の提案である。
+**設計案:** [直接登録の設計](../specs/2026-10-19-db-tool-registration-design.md)。実装とDBeaver補正を承認済み。
 
 ## 正本・範囲・実行方式
 
@@ -20,8 +20,8 @@
 
 ## 共通制約
 
-- 対象ツールを利用者が閉じてから追加する。起動中への転送は初期対象外。DBeaverの登録操作で起動したGUIは強制終了しない。
-- Mac/WindowsのpgAdmin・DBeaver Community、Windows amd64通常モードのA5を候補とし、段階0で検証済み版と保存形式を固定する。未検証の版/構成を自動で対応扱いにしない。
+- 対象ツールを利用者が閉じてから追加する。起動中への転送は初期対象外。DBeaverは追加JSONを保存し、GUIは起動しない。
+- Mac/WindowsのpgAdmin・DBeaver Community、Windows amd64通常モードのA5を候補とし、段階0で検証済み版と保存形式を固定する。未検証の版/構成を確認済みと表示しない。Windows実機確認は利用者の後日手順で補い、実装/自動テストとクロスビルドは先に進める。
 - 既存のファイル出力・URI・設定保存形式・Google認証・PATH・インストーラー・自己更新・セッション制御を変更しない。
 - `--replace`、`/SetDB`、削除、DBeaverの`-stop`/`-disconnectAll`/`-reuseWorkspace`、DBパスワード、shell経由の動的実行を使用しない。
 - 全工程は日本語のUI/資料と適切な日本語コメント。設定・パス・外部出力をsafeLog等で安全に表示し、バックアップ内容や資格情報をログへ出さない。
@@ -57,12 +57,12 @@
 - `dbToolOptions {Tool, Executable, PGAdminSQLite, PGAdminUser, DBeaverWorkspace string}`。
 - `dbToolTarget {Tool, Version, Executable, Python, SetupScript, Store, User, Project, Identity string}`。Identityは正規化した登録先・OSユーザーを含む。
 - `dbToolRegistrationPlan {Profile Profile; Target dbToolTarget; Name, Fingerprint, BeforeDigest, Disposition string}`。Dispositionは`add` / `already-present` / `conflict` / `unsupported` / `needs-inspection`。pgAdminは静的検出だけでは`needs-inspection`とし、確認後のスナップショット/重複検査で確定する。BeforeDigestには必要な設定DB/WAL等の対象集合を含め、ファイル本体だけで変更なしと判定しない。
-- `dbToolRegistrationResult {Status, Name, Target, Backup, Detail string; Submitted, Verified bool}`。Statusは`registered` / `already-present` / `conflict` / `cancelled` / `failed` / `unknown`。Submitted後のerrorは結果を消さない。
+- `dbToolRegistrationResult {Status, Name, Target, Backup, Detail string; Submitted, Committed, Verified bool}`。DBeaverのファイル確定はCommittedで保持し、アプリ読込みをVerifiedにしない。Statusは`保存済み（saved）` / `registered` / `already-present` / `conflict` / `cancelled` / `failed` / `unknown`。Submitted後のerrorは結果を消さない。
 - `(*App).planDBToolRegistration(ctx context.Context, p Profile, options dbToolOptions) (*dbToolRegistrationPlan, error)` は無起動/無書込みの検出・読取りを担当する。
 - `(*App).applyDBToolRegistration(ctx context.Context, plan *dbToolRegistrationPlan) (dbToolRegistrationResult, error)` は確認後の再検査・排他・バックアップ・pending・実行・照合を担当する。CLIとUIのどちらも同じ境界を使う。
 - `(*App).profileRegisterCommand() *cobra.Command` をprofileCommandへ登録する。
 - `uiDBToolRegistrationJob`はoperation/起点のconnection ID・attempt/プロフィール指紋、cancel、mutex、完了結果、表示済み状態を所有する。外部起動と結果の保持を画面のポインターだけに依存させない。
-- 既存`CommandRunner`は終了するpgAdmin処理等に再利用する。GUIの生存時間と登録完了が異なるDBeaver/A5用にはStart・Wait回収と状態照合を別に行う。プロセスをctx取消でkillする既存runnerをそのままGUIに流用しない。テスト差替えはApp上の最小境界に限定する。
+- 既存`CommandRunner`は終了するpgAdmin処理等に再利用する。GUIの生存時間と登録完了が異なるA5用にはStart・Wait回収と状態照合を別に行う。プロセスをctx取消でkillする既存runnerをそのままGUIに流用しない。テスト差替えはApp上の最小境界に限定する。
 
 ## 段階0: 互換性と実登録先の確認（実装前ゲート）
 
@@ -70,10 +70,10 @@ Primary: 設計/計画と私有の検証記録。Allowed: 破棄可能な設定�
 
 - [ ] 対象OSごとにツール名・正確な版・実行ファイル/Python・設定形式・検証環境を表に記録する。Mac/WindowsのpgAdminとDBeaver、Windows通常モードのA5を別行で扱う。
 - [ ] pgAdminは専用Pythonとsetup.pyの対、sqlite/userの指定、同じschemaの読み取り専用スナップショット、dump→load→dump、同名追加と終了コード0失敗を、一時DBだけで確認する。ユーザーDBへ暗黙の初期化/マイグレーションをしない判定方法を固定する。静的dry-runと、確認後のPythonによる検査を分ける。
-- [ ] DBeaverは一時workspace/Generalと初期データで、ドライバーID、`-data`の対象、保存フラグ、永続化時点、GUIが残るときの親子プロセス、複数data-sourcesファイルの読取りを確認する。新規設定がDB接続を開始しないことを観測する。Host/Port/DB/User/driverをパスワード復号なしで比較できるか確認し、できない版はREADYにしない。
+- [ ] DBeaverは一時workspace/Generalと初期データで、専用data-sources-csql-<ID>.jsonの公式読込み、driver ID、平文Userの扱い、複数ファイルの重複検査、通常終了/再起動後の追加ファイル保持を確認する。csqlのファイル確定とGUIでの読込みを別の結果として表示する。既存設定ファイルと暗号化資格情報を編集/復号しない。
 - [ ] A5はWindowsの破棄可能なOSユーザー等で、通常モードの保存先、/AddDBの同名拒否、/Exit、引数の日本語、設定読取りによる成功判定を確認する。ポータブル/Store構成の判別も確認する。
 - [ ] 各ツールが閉じていることをOSごとに検査できる条件と、起動プロセスを誤ってkillしない条件を固定する。
-- [ ] `READY`は対象版・保存先・重複判定・結果照合・既存保持が確認できた組合せだけ。別方式への変更は`NEEDS_SPEC_FIX`として設計に戻す。実行環境不足は`BLOCKED`として明示し、Windowsビルド成功で代替しない。
+- [ ] `READY`は対象版・保存先・重複判定・結果照合・既存保持が確認できた組合せだけ。別方式への変更は`NEEDS_SPEC_FIX`として設計に戻す。実行環境不足は未検証として明示し、利用者が後日実行するWindows手順へ残す。Windowsビルド成功で実機確認を代替しない。
 
 この段階の未確認事項を実装者の推測へ渡さない。互換性の確認だけで成立する数値/パスの確定は同じ案へ記録し、対応OS/対象版・登録方式・取消契約・scopeの変更は利用者レビューに戻す。READYにならない組合せを黙って除外して「3ツール対応完了」としない。
 
@@ -109,9 +109,9 @@ Primary: 変更全差分と私有の検証記録。Allowed: 同一実装担当�
 - [ ] 最終候補で`.tools/go/bin/go test -race ./... -count=1 -timeout=180s`、`.tools/go/bin/go vet ./...`、変更Goファイルのgofmt、`git diff --check`を実行する。
 - [ ] Mac arm64/amd64・Windows amd64の通常CLIビルドと、installerタグのビルド/既存テストを確認する。installerへGUI登録コマンドが混入しないことを確認する。
 - [ ] PTYで登録/取消/結果未確認/一時ファイル削除/一覧復帰を確認する。F2更新、4形式ファイル出力、Port変更、PC間移行は既存テストを再利用し、変更影響のある経路だけ実端末fixtureでも確認する。
-- [ ] 段階0の実ツール版で一時設定への初回追加・二回目の無変更・同名異内容の拒否・永続化・既存定義保持・新規DB接続なしを再確認する。起動中の場合の拒否もOS別に確認する。実機不足は残件にし、対応完了の条件を満たしたと報告しない。
+- [ ] 段階0の実ツール版で一時設定への初回追加・二回目の無変更・同名異内容の拒否・永続化・既存定義保持・新規DB接続なしを再確認する。起動中の場合の拒否もOS別に確認する。実機不足は残件にし、Windows動作確認を完了したと報告しない。
 - [ ] レビュー済みSHAとgate対象SHAを一致させ、ソース・自動テスト・Mac実ツール・Windows実機・未実施範囲を分けて報告する。候補とツールチェーン/検証範囲が不変の証拠は再利用し、返信を跨いだだけで全体テストを繰り返さない。
 
-## 現時点の状況
+## 承認と進捗
 
-設計・計画案の作成前にmainがcleanであることを確認した。コード変更・実ツール起動・実登録・テスト実行はまだ行っていないため、機能のbaseline PASSや実機対応は主張しない。実装を始めるには、両文書のレビュー、初期版の閉じたツールへの登録という範囲、直列実装/独立レビュー/実機確認範囲の合意が必要である。
+2026-10-19に利用者が直列実装・独立レビュー・検証と、DBeaver専用追加JSONへの補正を承認。Windowsは後日利用者が検証手順を実行する。詳細な実行証拠と未確認事項はこの計画専用の私有台帳に保持する。
