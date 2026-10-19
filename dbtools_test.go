@@ -2,11 +2,13 @@ package main
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf16"
 )
 
 // 利用者のworkspaceを模した原本に対し、CLIから保存・再実行・競合を確認する。
@@ -220,8 +222,15 @@ func TestDBToolRegistrationOutcome(t *testing.T) {
 					t.Fatal(e)
 				}
 				again, e := a.applyDBToolRegistration(context.Background(), newPlan)
-				if e == nil || again.Submitted {
+				if again.Submitted {
 					t.Fatal("結果不明の要求を自動再送")
+				}
+				if mode == "timeout-after-save" {
+					if e != nil || again.Status != "already-present" {
+						t.Fatalf("追加済みを再照合できない %+v %v", again, e)
+					}
+				} else if e == nil {
+					t.Fatal("未登録のunknownを再送可能にした")
 				}
 			}
 			if mode == "receipt-failure" && (!result.Verified || result.Status != "registered") {
@@ -304,6 +313,13 @@ func TestDBToolRegistrationPGAdminNative(t *testing.T) {
 	if err != nil || !r.Verified {
 		t.Fatalf("実保存を照合できない %+v %v", r, err)
 	}
+	for _, name := range []string{"pgadmin4.db", "pgadmin4.db.json", "復元手順.txt"} {
+		fi, e := os.Stat(filepath.Join(r.Backup, name))
+		if e != nil || fi.Mode().Perm() != 0600 {
+			t.Fatalf("バックアップ権限 %s %v %v", name, fi, e)
+		}
+	}
+
 	plan, err = a.planDBToolRegistration(context.Background(), p, o)
 	if err != nil {
 		t.Fatal(err)
@@ -340,5 +356,149 @@ func TestDBToolRegistrationDBeaverPackage(t *testing.T) {
 	result, err := a.applyDBToolRegistration(context.Background(), plan)
 	if err != nil || !result.Committed || result.Verified {
 		t.Fatalf("保存とGUI確認を混同 %+v %v", result, err)
+	}
+}
+
+// 保存形式が不明なA5には要求せず、確認できる形式だけを追加する。
+func TestDBToolRegistrationA5Store(t *testing.T) {
+	for _, kind := range []string{"empty", "binary", "unknown-string", "valid", "pending-saved", "x86"} {
+		t.Run(kind, func(t *testing.T) {
+			a, p, _, _ := dbToolFixture(t)
+			a.OS, a.Arch = "windows", "amd64"
+			exe := filepath.Join(filepath.Dir(a.Paths.ConfigDir), "A5M2.exe")
+			image := make([]byte, 152)
+			copy(image, "MZ")
+			binary.LittleEndian.PutUint32(image[60:], 128)
+			copy(image[128:], "PE\x00\x00")
+			machine := uint16(0x8664)
+			if kind == "x86" {
+				machine = 0x14c
+			}
+			binary.LittleEndian.PutUint16(image[132:], machine)
+			if err := os.WriteFile(exe, image, 0700); err != nil {
+				t.Fatal(err)
+			}
+			registryText := func(text string) a5RegistryValue {
+				u := append(utf16.Encode([]rune(text)), 0)
+				data := make([]byte, len(u)*2)
+				for i, v := range u {
+					binary.LittleEndian.PutUint16(data[i*2:], v)
+				}
+				return a5RegistryValue{Type: 1, Data: data}
+			}
+			name, conn, err := a5Connection(p)
+			if err != nil {
+				t.Fatal(err)
+			}
+			snapshot := a5RegistrySnapshot{Values: map[string]a5RegistryValue{}}
+			switch kind {
+			case "binary":
+				snapshot.Values["existing"] = a5RegistryValue{Type: 3, Data: []byte{1, 2}}
+			case "unknown-string":
+				snapshot.Values["existing"] = registryText("opaque-setting")
+			default:
+				if kind != "empty" {
+					snapshot.Values["existing"] = registryText(conn)
+				}
+			}
+			if kind == "pending-saved" {
+				snapshot.Values[name] = registryText(conn)
+			}
+			a.DBToolA5Read = func() ([]byte, error) { return json.Marshal(snapshot) }
+			a.DBToolA5Start = func(target dbToolTarget, n, c string) (bool, error) {
+				snapshot.Values[n] = registryText(c)
+				return true, nil
+			}
+			plan, err := a.planDBToolRegistration(context.Background(), p, dbToolOptions{Tool: "a5", Executable: exe})
+			if kind == "empty" || kind == "binary" || kind == "unknown-string" || kind == "x86" {
+				if err == nil {
+					t.Fatalf("未知形式を受理 %+v", plan)
+				}
+				if _, e := os.Stat(a.dbToolReceiptFile()); !os.IsNotExist(e) {
+					t.Fatal("拒否時にpendingを記録")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if kind == "pending-saved" {
+				if err := a.writeDBToolReceipt(dbToolReceipt{Version: 1, Entries: map[string]dbToolRegistrationResult{plan.ID: {Status: "unknown", Submitted: true, Backup: "previous-backup"}}}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			r, err := a.applyDBToolRegistration(context.Background(), plan)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if kind == "pending-saved" {
+				if r.Submitted || r.Status != "already-present" {
+					t.Fatalf("再送なしで解決できない %+v", r)
+				}
+			} else if !r.Submitted || !r.Verified || r.Status != "registered" {
+				t.Fatalf("追加照合できない %+v", r)
+			}
+			if len(snapshot.Values) != 2 {
+				t.Fatal("既存設定を失った")
+			}
+		})
+	}
+}
+
+func TestDBToolRegistrationDBeaverPending(t *testing.T) {
+	a, p, exe, w := dbToolFixture(t)
+	plan, err := a.planDBToolRegistration(context.Background(), p, dbToolOptions{Tool: "dbeaver", Executable: exe, DBeaverWorkspace: w})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := a.applyDBToolRegistration(context.Background(), plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.writeDBToolReceipt(dbToolReceipt{Version: 1, Entries: map[string]dbToolRegistrationResult{plan.ID: {Status: "unknown", Committed: true, Backup: r.Backup}}}); err != nil {
+		t.Fatal(err)
+	}
+	plan, err = a.planDBToolRegistration(context.Background(), p, plan.Options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err = a.applyDBToolRegistration(context.Background(), plan)
+	if err != nil || r.Status != "already-present" || r.Submitted || r.Verified {
+		t.Fatalf("ファイル確定を再照合できない %+v %v", r, err)
+	}
+	history, err := a.readDBToolReceipt()
+	if err != nil || history.Entries[plan.ID].Status != "already-present" {
+		t.Fatal("履歴が解決されない")
+	}
+}
+
+func TestDBToolRegistrationWindowsPGAdminDetection(t *testing.T) {
+	a, p, _, _ := dbToolFixture(t)
+	a.OS = "windows"
+	pf := filepath.Join(filepath.Dir(a.Paths.ConfigDir), "Program Files")
+	root := filepath.Join(pf, "pgAdmin 4", "v9")
+	for _, dir := range []string{filepath.Join(root, "python"), filepath.Join(root, "web")} {
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for path, data := range map[string]string{filepath.Join(root, "python/python.exe"): "fixture", filepath.Join(root, "web/setup.py"): "fixture", filepath.Join(root, "web/version.py"): "APP_RELEASE = 9\nAPP_REVISION = 18\n"} {
+		if err := os.WriteFile(path, []byte(data), 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	db := filepath.Join(filepath.Dir(a.Paths.ConfigDir), "pgadmin4.db")
+	if err := os.WriteFile(db, []byte("synthetic"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	a.Env = func(key string) string {
+		if key == "ProgramFiles" {
+			return pf
+		}
+		return ""
+	}
+	plan, err := a.planDBToolRegistration(context.Background(), p, dbToolOptions{Tool: "pgadmin", PGAdminSQLite: db})
+	if err != nil || plan.Target.Executable != root {
+		t.Fatalf("親とv9を別の導入候補と誤検出 %+v %v", plan, err)
 	}
 }

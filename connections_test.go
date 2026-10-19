@@ -1766,3 +1766,30 @@ func TestConnectionsDBToolRegistrationDelivery(t *testing.T) {
 		t.Fatal("遅延結果が終了画面を書き換えた")
 	}
 }
+
+func TestConnectionsDBToolRegistrationSmallTerminal(t *testing.T) {
+	a, p, exe, w := dbToolFixture(t)
+	h := newConnectionsHarness(t, a)
+	m := h.m
+	m.tab = tabProfiles
+	m.profiles = []Profile{p}
+	m.openActions()
+	m.editProfile = p
+	m.startDBToolRegistration()
+	plan, err := a.planDBToolRegistration(h.ctx, p, dbToolOptions{Tool: "dbeaver", Executable: exe, DBeaverWorkspace: w})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.registrationPlan = plan
+	m.state = "registrationConfirm"
+	h.update(tea.WindowSizeMsg{Width: 59, Height: 15})
+	h.key("tab")
+	h.key("enter")
+	if m.registrationYes || m.registrationJob != nil || m.state != "registrationConfirm" {
+		t.Fatal("確認内容が隠れたまま登録を開始")
+	}
+	h.key("esc")
+	if m.state != "registrationForm" {
+		t.Fatal("小さい画面で取消できない")
+	}
+}

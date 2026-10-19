@@ -4,10 +4,10 @@ package main
 
 import (
 	"context"
-	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"unsafe"
@@ -30,7 +30,22 @@ func dbToolRunning(ctx context.Context, t dbToolTarget) (bool, error) {
 			return false, err
 		}
 		name := strings.ToLower(windows.UTF16ToString(entry.ExeFile[:]))
-		if t.Tool == "dbeaver" && (name == "dbeaver.exe" || name == "dbeaverc.exe") || t.Tool == "pgadmin" && (strings.Contains(name, "pgadmin") || name == "python.exe" || name == "pythonw.exe") || t.Tool == "a5" && name == "a5m2.exe" {
+		if t.Tool == "pgadmin" && (name == "python.exe" || name == "pythonw.exe") {
+			process, e := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, entry.ProcessID)
+			if e != nil {
+				return false, fmt.Errorf("Pythonプロセスの配置を確認できません: %w", e)
+			}
+			buf := make([]uint16, 32768)
+			size := uint32(len(buf))
+			e = windows.QueryFullProcessImageName(process, 0, &buf[0], &size)
+			windows.CloseHandle(process)
+			if e != nil {
+				return false, e
+			}
+			if strings.EqualFold(filepath.Clean(windows.UTF16ToString(buf[:size])), filepath.Clean(t.Python)) {
+				return true, nil
+			}
+		} else if t.Tool == "dbeaver" && (name == "dbeaver.exe" || name == "dbeaverc.exe") || t.Tool == "pgadmin" && strings.Contains(name, "pgadmin") || t.Tool == "a5" && name == "a5m2.exe" {
 			return true, nil
 		}
 		err = windows.Process32Next(h, &entry)
@@ -82,16 +97,6 @@ func readA5Settings() ([]byte, error) {
 		s.Values[name] = a5RegistryValue{typ, data[:n]}
 	}
 	return json.Marshal(s)
-}
-func a5RegistryString(v a5RegistryValue) (string, error) {
-	if v.Type != registry.SZ || len(v.Data)%2 != 0 {
-		return "", fmt.Errorf("A5設定値の型が不正です")
-	}
-	u := make([]uint16, len(v.Data)/2)
-	for i := range u {
-		u[i] = binary.LittleEndian.Uint16(v.Data[i*2:])
-	}
-	return windows.UTF16ToString(u), nil
 }
 func startA5Registration(t dbToolTarget, name, conn string) (bool, error) {
 	// CommandContextでGUIを強制終了しない。Waitは別に回収し、登録は保存先を照合する。

@@ -37,9 +37,6 @@ func readA5Settings() ([]byte, error) {
 func startA5Registration(dbToolTarget, string, string) (bool, error) {
 	return false, fmt.Errorf("A5直接登録はWindowsで利用してください")
 }
-func a5RegistryString(a5RegistryValue) (string, error) {
-	return "", fmt.Errorf("A5レジストリはWindowsで検査してください")
-}
 
 func dbToolPrivate(path string, dir bool) error {
 	if dir {

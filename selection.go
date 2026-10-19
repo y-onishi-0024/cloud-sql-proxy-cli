@@ -1502,6 +1502,9 @@ func (m *connectUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.interaction++
 		}
 		if strings.HasPrefix(m.state, "registration") {
+			if m.selector.width > 0 && (m.selector.width < 60 || m.selector.height < 16) && key != "esc" {
+				return m, nil
+			}
 			return m, m.dbToolRegistrationKey(v)
 		}
 		if strings.HasPrefix(m.state, "update") {

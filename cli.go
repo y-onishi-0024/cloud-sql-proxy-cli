@@ -58,6 +58,8 @@ type App struct {
 	RestartSelf                           func(string) error
 	DBToolRunning                         func(context.Context, dbToolTarget) (bool, error)
 	DBToolRun                             func(context.Context, string, []string) ([]byte, error)
+	DBToolA5Read                          func() ([]byte, error)
+	DBToolA5Start                         func(dbToolTarget, string, string) (bool, error)
 }
 type synchronizedWriter struct {
 	writer io.Writer

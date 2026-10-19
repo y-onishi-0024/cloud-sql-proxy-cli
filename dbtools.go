@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"debug/pe"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -18,6 +20,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf16"
 
 	"github.com/spf13/cobra"
 )
@@ -109,6 +113,14 @@ func (a *App) detectDBTool(o dbToolOptions) (dbToolTarget, error) {
 		seen := map[string]bool{}
 		for _, p := range candidates {
 			if _, e := os.Stat(p); e == nil {
+				if o.Tool == "pgadmin" && a.OS == "windows" {
+					if _, e := os.Stat(filepath.Join(p, "python/python.exe")); e != nil {
+						continue
+					}
+					if _, e := os.Stat(filepath.Join(p, "web/setup.py")); e != nil {
+						continue
+					}
+				}
 				resolved, e := filepath.EvalSymlinks(p)
 				if e == nil && !seen[resolved] {
 					seen[resolved] = true
@@ -233,6 +245,22 @@ func (a *App) detectDBTool(o dbToolOptions) (dbToolTarget, error) {
 		}
 		if !strings.EqualFold(filepath.Base(exe), "A5M2.exe") || strings.Contains(strings.ToLower(exe), "windowsapps") {
 			return t, fmt.Errorf("A5通常版のA5M2.exeを指定してください")
+		}
+		binary, err := pe.Open(exe)
+		if err != nil {
+			return t, fmt.Errorf("A5実行ファイルの形式を確認できません: %w", err)
+		}
+		machine := binary.Machine
+		_ = binary.Close()
+		if machine != pe.IMAGE_FILE_MACHINE_AMD64 {
+			return t, fmt.Errorf("A5直接登録はamd64版A5M2.exeを指定してください")
+		}
+		portable, err := filepath.Glob(filepath.Join(filepath.Dir(exe), "Portable*"))
+		if err != nil {
+			return t, err
+		}
+		if len(portable) > 0 {
+			return t, fmt.Errorf("A5のPortable/workspace構成は直接登録の対象外です")
 		}
 		for _, p := range []string{filepath.Join(filepath.Dir(exe), "Portable"), filepath.Join(filepath.Dir(exe), "A5M2.ini")} {
 			if _, e := os.Lstat(p); e == nil {
@@ -395,7 +423,7 @@ func (a *App) planDBToolRegistration(ctx context.Context, p Profile, o dbToolOpt
 	}
 	if t.Tool == "a5" {
 		var raw []byte
-		raw, err = readA5Settings()
+		raw, err = a.readA5Settings()
 		plan.Files = []pathFile{{Path: t.Store, Before: raw, Exists: err == nil}}
 	} else {
 		plan.Files, err = dbToolFiles(t)
@@ -405,6 +433,9 @@ func (a *App) planDBToolRegistration(ctx context.Context, p Profile, o dbToolOpt
 	}
 	if t.Tool == "a5" {
 		plan.Disposition = a5Disposition(plan.Files[0].Before, plan.Name, string(plan.Data))
+		if plan.Disposition == "unsupported" {
+			return nil, fmt.Errorf("A5の登録保存形式を確認できません。空の保存先・未知の値形式では直接登録しません。ファイル出力を利用してください")
+		}
 	}
 	plan.BeforeDigest = dbToolHash(plan.Files)
 	if t.Tool == "dbeaver" {
@@ -432,7 +463,7 @@ func dbToolResultText(r dbToolRegistrationResult, err error) string {
 		s += "\n登録先: " + r.Target
 	}
 	if r.Backup != "" {
-		s += "\nバックアップ: " + r.Backup
+		s += "\nバックアップ: " + r.Backup + "\n復元手順: " + filepath.Join(r.Backup, "復元手順.txt")
 	}
 	if r.Detail != "" {
 		s += "\n" + r.Detail
@@ -598,16 +629,33 @@ func (a *App) applyDBToolRegistration(ctx context.Context, p *dbToolRegistration
 	if err != nil {
 		return r, err
 	}
-	if old, ok := receipt.Entries[p.ID]; ok && old.Status == "unknown" {
+	old, pending := receipt.Entries[p.ID]
+	pending = pending && old.Status == "unknown"
+	if pending {
+		r.Backup = old.Backup
+	}
+	reconcile := func() (dbToolRegistrationResult, error) {
+		r.Status = "already-present"
+		r.Verified = p.Target.Tool != "dbeaver"
+		receipt.Entries[p.ID] = r
+		if pending {
+			return r, a.writeDBToolReceipt(receipt)
+		}
+		return r, nil
+	}
+	refusePending := func() (dbToolRegistrationResult, error) {
+		r.Status = "unknown"
 		return r, fmt.Errorf("前回の登録結果が未確認です。登録先と履歴 %s を確認してください。自動再送しません", a.dbToolReceiptFile())
+	}
+	if pending && p.Target.Tool != "pgadmin" && fresh.Disposition != "already-present" {
+		return refusePending()
 	}
 	if fresh.Disposition == "conflict" {
 		r.Status = "conflict"
 		return r, fmt.Errorf("同名またはIDの異なる設定があります")
 	}
 	if fresh.Disposition == "already-present" {
-		r.Status = "already-present"
-		return r, nil
+		return reconcile()
 	}
 	if err = secureDir(filepath.Join(a.Paths.ConfigDir, "db-tool-backups", p.Target.Tool)); err != nil {
 		return r, err
@@ -620,6 +668,10 @@ func (a *App) applyDBToolRegistration(ctx context.Context, p *dbToolRegistration
 	if err = dbToolPrivate(backup, true); err != nil {
 		return r, err
 	}
+	if err = dbToolWriteNew(filepath.Join(backup, "復元手順.txt"), []byte(dbToolRestoreText(p))); err != nil {
+		return r, err
+	}
+
 	if err = secureDir(filepath.Join(a.Paths.CacheDir, "db-tool-register")); err != nil {
 		return r, err
 	}
@@ -639,8 +691,10 @@ func (a *App) applyDBToolRegistration(ctx context.Context, p *dbToolRegistration
 		}
 		disposition := pgAdminDisposition(before, p)
 		if disposition == "already-present" {
-			r.Status = disposition
-			return r, nil
+			return reconcile()
+		}
+		if pending {
+			return refusePending()
 		}
 		if disposition == "conflict" {
 			r.Status = disposition
@@ -729,7 +783,7 @@ func (a *App) applyDBToolRegistration(ctx context.Context, p *dbToolRegistration
 		}
 		r.Status, r.Verified = "registered", true
 	case "a5":
-		r.Submitted, err = startA5Registration(p.Target, p.Name, string(p.Data))
+		r.Submitted, err = a.startA5Registration(p.Target, p.Name, string(p.Data))
 		if err != nil {
 			if !r.Submitted {
 				r.Status = "failed"
@@ -739,7 +793,7 @@ func (a *App) applyDBToolRegistration(ctx context.Context, p *dbToolRegistration
 		ticker := time.NewTicker(200 * time.Millisecond)
 		defer ticker.Stop()
 		for {
-			raw, e := readA5Settings()
+			raw, e := a.readA5Settings()
 			if e == nil {
 				status := a5Disposition(raw, p.Name, string(p.Data))
 				if status == "already-present" {
@@ -769,7 +823,8 @@ func (a *App) applyDBToolRegistration(ctx context.Context, p *dbToolRegistration
 }
 
 // Pythonのコードは固定し、パスやユーザー名はargvだけで渡す。原本DBの初期化・移行は禁止する。
-const pgAdminSnapshotPython = `import sys,sqlite3,json,base64,pathlib
+const pgAdminSnapshotPython = `import sys,sqlite3,json,base64,pathlib,os
+os.umask(0o077)
 src,dst,user=sys.argv[1:4]
 con=sqlite3.connect(pathlib.Path(src).as_uri()+'?mode=ro',uri=True,timeout=5)
 if con.execute("select value from version where name='ConfigDB'").fetchone() != (52,): raise RuntimeError('unsupported schema')
@@ -778,6 +833,7 @@ copy=sqlite3.connect(dst);con.backup(copy);copy.close();con.close()
 print('{}')
 `
 const pgAdminSetupPython = `import os,sys,runpy,pathlib
+os.umask(0o077)
 setup,work=sys.argv[1:3]
 config=pathlib.Path(work)/'config_distro.py'
 config.write_text('SERVER_MODE=False\nDATA_DIR='+repr(str(pathlib.Path(work)/'data'))+'\nUSE_OS_SECRET_STORAGE=False\n',encoding='utf-8')
@@ -803,6 +859,9 @@ func (a *App) pgAdminSnapshot(ctx context.Context, t dbToolTarget, work, dest st
 	}
 	output := dest + ".json"
 	if err := a.pgAdminSetup(ctx, t, work, "dump-servers", output, "--sqlite-path", dest, "--user", t.User); err != nil {
+		return nil, err
+	}
+	if err := dbToolPrivate(output, false); err != nil {
 		return nil, err
 	}
 	b, _, err := pathRead(output, dbToolJSONLimit)
@@ -884,8 +943,15 @@ type a5RegistrySnapshot struct{ Values map[string]a5RegistryValue }
 
 func a5Disposition(raw []byte, name, connection string) string {
 	var s a5RegistrySnapshot
-	if json.Unmarshal(raw, &s) != nil {
-		return "conflict"
+	if json.Unmarshal(raw, &s) != nil || len(s.Values) == 0 {
+		return "unsupported"
+	}
+	// 未実測の保存形式を推測で書き換えない。対象名以外の値も構造を確認する。
+	for _, v := range s.Values {
+		text, err := a5RegistryString(v)
+		if err != nil || !validA5Connection(text) {
+			return "unsupported"
+		}
 	}
 	found := false
 	for n, v := range s.Values {
@@ -979,3 +1045,99 @@ func dbToolWriteState(path string, b []byte) error {
 	}
 	return os.Rename(f.Name(), path)
 }
+
+func (a *App) readA5Settings() ([]byte, error) {
+	if a.DBToolA5Read != nil {
+		return a.DBToolA5Read()
+	}
+	return readA5Settings()
+}
+func (a *App) startA5Registration(t dbToolTarget, name, conn string) (bool, error) {
+	if a.DBToolA5Start != nil {
+		return a.DBToolA5Start(t, name, conn)
+	}
+	return startA5Registration(t, name, conn)
+}
+func a5RegistryString(v a5RegistryValue) (string, error) {
+	if v.Type != 1 || len(v.Data) < 2 || len(v.Data)%2 != 0 {
+		return "", fmt.Errorf("A5設定値の型が不正です")
+	}
+	u := make([]uint16, len(v.Data)/2)
+	for i := range u {
+		u[i] = binary.LittleEndian.Uint16(v.Data[i*2:])
+	}
+	if u[len(u)-1] != 0 {
+		return "", fmt.Errorf("A5設定値の終端が不正です")
+	}
+	for _, c := range u[:len(u)-1] {
+		if c == 0 {
+			return "", fmt.Errorf("A5設定値に途中の終端があります")
+		}
+	}
+	return string(utf16.Decode(u[:len(u)-1])), nil
+}
+func validA5Connection(s string) bool {
+	if strings.ContainsFunc(s, unicode.IsControl) {
+		return false
+	}
+	values := map[string]string{}
+	for _, part := range strings.Split(strings.TrimSuffix(s, ";"), ";") {
+		key, value, ok := strings.Cut(part, "=")
+		if !ok || key == "" {
+			return false
+		}
+		key = strings.ToLower(key)
+		if _, exists := values[key]; exists {
+			return false
+		}
+		values[key] = value
+	}
+	port, err := strconv.Atoi(values["port"])
+	provider := values["providername"]
+	return err == nil && port > 0 && port <= 65535 && values["__connectiontype"] == "Internal" && (provider == "PostgreSQL" || provider == "MySQL" || provider == "SQL Server") && values["servername"] != "" && values["database"] != "" && values["username"] != ""
+}
+
+// 復元は人の判断で行う。csqlは自動復元や既存設定の削除を実行しない。
+func dbToolRestoreText(p *dbToolRegistrationPlan) string {
+	text := "DBツール設定の手動復元\n\n対象: " + p.Target.Tool + "\n登録先: " + p.Target.Store + "\n\n対象ツールとcsqlを終了してください。別端末のProxy停止は不要です。\n現在の設定一式を先に別の私有フォルダーへ退避し、バックアップと混在させないでください。バックアップは資格情報を含み得るため共有しないでください。\n復元はバックアップ時点へ戻す操作です。後から追加した設定は保持できない場合があります。判断できない場合は、原本を残したままツールの管理者へ相談してください。\n\n"
+	switch p.Target.Tool {
+	case "pgadmin":
+		text += "pgadmin4.db がSQLite backup APIで作成した一貫した設定DBです。元の設定DBと同じ名前でコピーします。原本DBと同じ場所にある -wal / -shm / -journal も先に現在状態の退避先へ移動し、復元DBと古い補助ファイルを混在させないでください。pgadmin4.db.json は確認用の定義一覧で、SQLiteの代わりにはなりません。復元後、同じpgAdmin版で一覧を確認し、DBへは自動接続しないでください。\n"
+	case "dbeaver":
+		text += "csqlは既存ファイルを変更しません。追加だけを取り消す場合は、次の専用ファイルだけを別の私有フォルダーへ移動し、DBeaverを起動して確認してください。既存JSONやcredentials-config.jsonを削除しないでください。\n追加ファイル: " + filepath.Join(p.Target.Store, p.Target.Project, ".dbeaver", "data-sources-"+p.ID+".json") + "\n\n既存設定の復元が必要な場合だけ、次の対応でバックアップを元の名前へコピーしてください。\n"
+		for i, f := range p.Files {
+			if f.Exists {
+				text += fmt.Sprintf("%03d-%s → %s\n", i, filepath.Base(f.Path), f.Path)
+			}
+		}
+	case "a5":
+		text += "000-registry.jsonはレジストリ値の型と生バイトを記録したJSONです。.regファイルとしてはインポートできません。追加だけを取り消す場合は、A5のDB登録一覧で対象名だけを手動削除してください。\n対象登録名: " + p.Name + "\n\n既存値の復元が必要な場合は、Windows PowerShellで次の手順を実行します。現在の同名値を上書きするため、先にreg exportで現在状態をこの私有フォルダー内の別名へ退避します。後から増えた別名は削除しません。\n\n" + a5RestoreInstructions
+	}
+	return text
+}
+
+const a5RestoreInstructions = `# 対象ツールを閉じ、バックアップフォルダーの絶対パスを入力する。
+$restoreDir = Read-Host 'バックアップフォルダー'
+$currentExport = Join-Path $restoreDir 'current-before-restore.reg'
+if (Test-Path $currentExport) { throw '退避先が既存です。別名へ退避してください' }
+reg export 'HKCU\Software\mmatsubara\A5M2(x64)\DataSources' $currentExport
+if ($LASTEXITCODE -ne 0) { throw '現在状態の退避に失敗しました' }
+$backup = Get-Content -LiteralPath (Join-Path $restoreDir '000-registry.json') -Raw | ConvertFrom-Json
+$values = @($backup.Values.PSObject.Properties)
+if ($values.Count -eq 0) { throw '復元対象がありません' }
+foreach ($value in $values) {
+ if ($value.Value.Type -ne 1) { throw '未対応の値型です。変更せず管理者へ確認してください' }
+}
+Write-Host ('復元する既存値: ' + $values.Count + '件。後から増えた別名は削除しません。')
+if ((Read-Host '実行する場合だけRESTOREを入力') -cne 'RESTORE') { throw '取消しました' }
+$registryKey = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Software\mmatsubara\A5M2(x64)\DataSources', $true)
+if ($null -eq $registryKey) { throw '指定した通常モードの登録先がありません' }
+try {
+ foreach ($value in $values) {
+  $bytes = [Convert]::FromBase64String($value.Value.Data)
+  $text = [Text.Encoding]::Unicode.GetString($bytes).TrimEnd([char]0)
+  $registryKey.SetValue($value.Name, $text, [Microsoft.Win32.RegistryValueKind]::String)
+ }
+} finally { $registryKey.Dispose() }
+Write-Host 'A5を起動し既存定義を確認してください。DB接続は手動です。'
+`
