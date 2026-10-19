@@ -426,7 +426,7 @@ func TestConnectionsAddSwitchAndStop(t *testing.T) {
 		awaitProxyPort(t, row.Port)
 	}
 	h.key("esc")
-	h.m.updateVersion = "v0.8.0"
+	h.m.updateVersion = "v0.9.0"
 	if !strings.Contains(h.m.View(), "稼働 2件") {
 		t.Fatal("更新通知で稼働件数を喪失")
 	}
@@ -1111,7 +1111,7 @@ func TestConnectionsSelfUpdate(t *testing.T) {
 				t.Fatal("検索0件の共通更新が開かない", h.m.state)
 			}
 			h.pumpUntil(func() bool { return h.m.state == "updateConfirm" }, "更新確認")
-			if !strings.Contains(h.m.View(), "0.8.0") {
+			if !strings.Contains(h.m.View(), "0.9.0") {
 				t.Fatal("版の確認がない")
 			}
 			if mode == "decline" {

@@ -86,6 +86,13 @@ Escは準備を取消、Ctrl+Cは自画面の接続を停止して終了しま�
 配置失敗では旧版/管理記録を復元します。復元できない場合は表示されたバックアップ絶対パスと公式setupによる復旧手順を確認してください。
 既存の接続設定・ポート・認証・Googleツール・PATH設定を保持します。
 
+PC間の設定移行（両PCともv0.8.0以降が必要です）
+旧PCのCtrl+Kから「移行ファイルを書き出す」、新PCで「移行ファイルを取り込む」を選べます。
+CLIは csql migrate export / csql migrate import FILE --dry-run / csql migrate import FILE です。
+保存済み設定だけを追加し、同一はスキップ・競合は全体を拒否します。既存設定は取込前にバックアップします。
+Google認証・PATH・ツール・稼働セッション・DBブラウザ登録は移しません。新PCでdoctor/setupとDBツール向け再出力を行ってください。
+移行JSONは暗号化せずプロジェクト・DBユーザー名を含みます。実際の保存先・対象件数を確認して受け渡してください。
+
 通常CLIは csql-{version}-<OS>-<CPU>（Windowsだけ.exe）です。
 通常CLIは同じ候補のinstaller内部payloadと一致しています。新規導入ではセットアップがPATHと導入確認を案内します。
 SHA256SUMS.txtにはZIP3種と通常CLI5種のSHA-256を記載しています。
