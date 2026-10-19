@@ -874,6 +874,9 @@ func (m *connectUI) executeAction(action uiAction) tea.Cmd {
 }
 func (m *connectUI) openHelp() {
 	screen := map[string]string{"registrationTools": "登録先ツール", "registrationForm": "登録先入力", "registrationPreparing": "登録先の検査", "registrationConfirm": "登録前確認", "registrationApplying": "直接登録", "registrationCancelling": "登録結果の確認", "registrationResult": "登録結果", "list": "一覧", "actions": "操作メニュー", "form": "接続設定の保存", "portForm": "ポート変更", "export": "出力先の入力", "exportTools": "出力ツールの選択", "error": "エラーと対処", "saving": "保存処理中", "searching": "インスタンス検索", "stopping": "終了処理中", "connecting": "接続情報", "updateChecking": "更新情報の確認", "updateConfirm": "csql更新の確認", "updatePreparing": "更新の取得と検証", "updateCancelling": "更新の取消", "migrationPath": "移行ファイルのパス", "migrationPreparing": "移行内容の確認", "migrationConfirm": "取込の実行前確認", "migrationApplying": "移行ファイルの保存", "migrationCancelling": "移行処理の取消"}[m.state]
+	if m.state == "migrationMenu" {
+		screen = "データ移行"
+	}
 	lines := []string{"現在の画面: " + screen}
 	switch m.state {
 	case "registrationTools", "registrationForm", "registrationPreparing", "registrationConfirm", "registrationApplying", "registrationCancelling", "registrationResult":
@@ -904,6 +907,7 @@ func (m *connectUI) openHelp() {
 	}
 	if !m.addOnly && (m.state == "list" || m.state == "error") {
 		lines = append(lines, "F2 csqlを更新（接続先の選択は不要）")
+		lines = append(lines, "F3 データ移行（保存済み接続先の全件出力・取込）")
 	}
 	lines = append(lines, "F1/Esc ヘルプを閉じる", "Ctrl+C この画面の全接続停止", "コピー後は別ターミナルで実行し、戻って再試行", "DBログイン未検証")
 	var p Profile
@@ -929,7 +933,9 @@ func (m *connectUI) openHelp() {
 	if m.updateVersion != "" {
 		lines = append(lines, "", "更新 "+m.updateVersion, "一覧のF2、またはCtrl+K → 更新でcsql内から更新", updatePage)
 	}
-	if strings.HasPrefix(m.state, "migration") {
+	if m.state == "migrationMenu" {
+		lines = append(lines, "", "データ移行: ↑↓/Tab 選択  Enter 次へ  Esc 一覧へ", "保存済み接続先の全件が対象。検索・選択行には依存しません", "未保存の接続は一覧でCtrl+Sから先に保存してください", "DB内のデータ・認証・PATH・DBツール設定は移行しません")
+	} else if strings.HasPrefix(m.state, "migration") {
 		lines = append(lines, "", "移行: Enter 実行前確認 / ←→・Tab 取消と取込を選択", "PgUp/PgDn 詳細 / Esc 戻る・処理取消", "認証・PATH・未保存接続は移行しません")
 	}
 	if m.migrationReport != "" {
@@ -1511,6 +1517,9 @@ func (m *connectUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, m.selfUpdateKey(key)
 		}
 		if strings.HasPrefix(m.state, "migration") {
+			if m.state == "migrationMenu" && m.selector.width > 0 && (m.selector.width < 60 || m.selector.height < 16) && key != "esc" {
+				return m, nil
+			}
 			return m, m.migrationKey(v)
 		}
 		if m.exit || m.state == "saving" || m.state == "stopping" {
@@ -1522,6 +1531,10 @@ func (m *connectUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// 一覧の共通操作として、選択行や接続状態に依存せず既存の更新確認へ進む。
 		if key == "f2" && (m.state == "list" || m.state == "error") {
 			return m, m.startSelfUpdate()
+		}
+		// PC移行は選択行ではなく保存済み設定全体の操作として案内する。
+		if key == "f3" && (m.state == "list" || m.state == "error") {
+			return m, m.startMigration("menu")
 		}
 		if d, _, page := m.recovery(); d != nil && (m.state == "error" || m.state == "connecting") && (key == "pgup" || key == "pgdown") {
 			width, height := m.dimensions()
@@ -1859,7 +1872,7 @@ func (m *connectUI) View() string {
 	if strings.HasPrefix(m.state, "migration") {
 		return m.migrationView(v, width, height, tabs)
 	}
-	v.updateAction = !m.addOnly && (m.state == "list" || m.state == "error")
+	v.globalActions = !m.addOnly && (m.state == "list" || m.state == "error")
 	footer := []string{"↑↓ 選択  Enter 接続  Tab 切替  Ctrl+S 保存", "Ctrl+U 消去  Ctrl+L 注意  Esc 戻る  Ctrl+C 全接続停止"}
 	if m.state == "list" {
 		tabs = m.tabsView()
@@ -2522,12 +2535,14 @@ func (m *connectUI) migrationWork(phase string, run func(context.Context) uiMigr
 	return tea.Batch(cmd, m.ensureTick())
 }
 func (m *connectUI) startMigration(kind string) tea.Cmd {
-	if m.exit || m.addOnly || m.updateJob != nil || m.migrationJob != nil || (m.state != "actions" && m.state != "list" && m.state != "error") {
+	if m.exit || m.addOnly || m.updateJob != nil || m.migrationJob != nil || (m.state != "actions" && m.state != "list" && m.state != "error" && m.state != "migrationMenu") {
 		return nil
 	}
 	origin := m.captureActions()
 	if m.state == "actions" {
 		origin = m.actionOrigin
+	} else if m.state == "migrationMenu" {
+		origin = m.migrationOrigin
 	}
 	if origin == nil {
 		return nil
@@ -2539,6 +2554,11 @@ func (m *connectUI) startMigration(kind string) tea.Cmd {
 	m.migrationYes = false
 	m.message = ""
 	m.migrationPreview = nil
+	if kind == "menu" {
+		m.state = "migrationMenu"
+		m.migrationKind = "export"
+		return nil
+	}
 	if kind == "import" {
 		m.state = "migrationPath"
 		m.fields = []formField{{label: "取込ファイル（Enterで確認・Escで戻る）"}}
@@ -2688,6 +2708,19 @@ func (m *connectUI) migrationKey(key tea.KeyMsg) tea.Cmd {
 	if m.migrationJob != nil {
 		return nil
 	}
+	if m.state == "migrationMenu" {
+		switch k {
+		case "up", "down", "tab", "shift+tab":
+			if m.migrationKind == "export" {
+				m.migrationKind = "import"
+			} else {
+				m.migrationKind = "export"
+			}
+		case "enter":
+			return m.startMigration(m.migrationKind)
+		}
+		return nil
+	}
 	if m.state == "migrationConfirm" {
 		p := m.migrationPreview
 		if k == "tab" || k == "left" || k == "right" || k == "up" || k == "down" {
@@ -2746,6 +2779,16 @@ func (m *connectUI) migrationKey(key tea.KeyMsg) tea.Cmd {
 	return nil
 }
 func (m *connectUI) migrationView(v terminalView, width, height int, tabs string) string {
+	if m.state == "migrationMenu" {
+		options := []string{"  全接続先を書き出す（旧PC）", "  移行ファイルを取り込む（新PC）"}
+		selected := 0
+		if m.migrationKind == "import" {
+			selected = 1
+		}
+		options[selected] = "›" + options[selected][1:]
+		lines := append(options, "", "対象: 保存済み接続先の全件", "検索条件・選択行に関係なく移行します", "未保存の接続は先にCtrl+Sで保存してください", "DB内のデータ・認証・パスワードは含みません")
+		return v.frame("データ移行", tabs, "PCの引越し", v.panel("接続設定をまとめて移行", lines, width, height-4), []string{"↑↓ / Tab 選択  Enter 次へ", "Esc 一覧へ戻る  Ctrl+C 全接続停止"})
+	}
 	title := "移行ファイルの取込"
 	if m.migrationKind == "export" {
 		title = "移行ファイルの書出し"
@@ -2755,7 +2798,9 @@ func (m *connectUI) migrationView(v terminalView, width, height int, tabs string
 		badge = "パス入力"
 		lines = []string{m.fields[0].label, inputView(m.fields[0].value, m.fields[0].pos, width-8)}
 		if m.migrationKind == "export" {
-			lines = append(lines, fmt.Sprintf("対象: 保存済み %d件", m.migrationCount), "プロジェクト・DBユーザー名を含みます。認証やパスワードは含みません", "既存の出力ファイルは上書きしません")
+			lines = append(lines, fmt.Sprintf("対象: 保存済み接続先の全件（%d件）", m.migrationCount), "検索条件・選択行に関係なく全件を出力します", "プロジェクト・DBユーザー名を含みます。認証やパスワードは含みません", "既存の出力ファイルは上書きしません")
+		} else {
+			lines = append(lines, "対象: 移行ファイル内の接続設定の全件", "追加・同一・競合を確認してから取り込みます")
 		}
 		if m.message != "" {
 			lines = append(lines, "", m.message)
