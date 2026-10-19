@@ -266,6 +266,16 @@ type connectUI struct {
 	frame                                int
 	updateVersion                        string
 	pendingUpdate                        *preparedSelfUpdate
+	migrationKind                        string
+	migrationOrigin                      *actionContext
+	migrationData                        []byte
+	migrationCount                       int
+	migrationPreview                     *migrationPreview
+	migrationJob                         *uiMigrationJob
+	migrationOperation                   uint64
+	migrationYes                         bool
+	migrationPage                        int
+	migrationReport                      string
 	updateJob                            *uiSelfUpdateJob
 	updateOperation                      uint64
 	updateOrigin                         *actionContext
@@ -329,6 +339,9 @@ func (m *connectUI) closeWork() {
 	m.workMu.Lock()
 	m.workClosed = true
 	m.workMu.Unlock()
+	if m.migrationJob != nil {
+		m.migrationJob.cancel()
+	}
 	if m.cancelAll != nil {
 		m.cancelAll()
 	}
@@ -358,7 +371,7 @@ func (m *connectUI) beginShutdown() tea.Cmd {
 	return func() tea.Msg { m.workers.Wait(); return uiShutdownComplete{} }
 }
 func (m *connectUI) ensureTick() tea.Cmd {
-	if m.exit || m.tickPending || (!m.searching && m.state != "saving" && !m.hasOwnedWork() && m.updateJob == nil) {
+	if m.exit || m.tickPending || (!m.searching && m.state != "saving" && !m.hasOwnedWork() && m.updateJob == nil && m.migrationJob == nil) {
 		return nil
 	}
 	m.tickPending = true
@@ -640,6 +653,7 @@ func (m *connectUI) availableActions() []uiAction {
 		}
 	}
 	if !m.addOnly {
+		rows = append(rows, uiAction{ID: "migration-export", Label: "移行ファイルを書き出す", Keywords: "migration export 移行 バックアップ"}, uiAction{ID: "migration-import", Label: "移行ファイルを取り込む", Keywords: "migration import 移行 取り込む 復元"})
 		rows = append(rows, uiAction{ID: "self-update", Label: "csqlを更新", Keywords: "update 更新 upgrade"})
 	}
 	return rows
@@ -754,6 +768,9 @@ func (m *connectUI) executeShortcut(id string) tea.Cmd {
 	return nil
 }
 func (m *connectUI) executeAction(action uiAction) tea.Cmd {
+	if strings.HasPrefix(action.ID, "migration-") {
+		return m.startMigration(strings.TrimPrefix(action.ID, "migration-"))
+	}
 	if action.ID == "self-update" {
 		return m.startSelfUpdate()
 	}
@@ -822,7 +839,7 @@ func (m *connectUI) executeAction(action uiAction) tea.Cmd {
 	return nil
 }
 func (m *connectUI) openHelp() {
-	screen := map[string]string{"list": "一覧", "actions": "操作メニュー", "form": "接続設定の保存", "portForm": "ポート変更", "export": "出力先の入力", "exportTools": "出力ツールの選択", "error": "エラーと対処", "saving": "保存処理中", "searching": "インスタンス検索", "stopping": "終了処理中", "connecting": "接続情報", "updateChecking": "更新情報の確認", "updateConfirm": "csql更新の確認", "updatePreparing": "更新の取得と検証", "updateCancelling": "更新の取消"}[m.state]
+	screen := map[string]string{"list": "一覧", "actions": "操作メニュー", "form": "接続設定の保存", "portForm": "ポート変更", "export": "出力先の入力", "exportTools": "出力ツールの選択", "error": "エラーと対処", "saving": "保存処理中", "searching": "インスタンス検索", "stopping": "終了処理中", "connecting": "接続情報", "updateChecking": "更新情報の確認", "updateConfirm": "csql更新の確認", "updatePreparing": "更新の取得と検証", "updateCancelling": "更新の取消", "migrationPath": "移行ファイルのパス", "migrationPreparing": "移行内容の確認", "migrationConfirm": "取込の実行前確認", "migrationApplying": "移行ファイルの保存", "migrationCancelling": "移行処理の取消"}[m.state]
 	lines := []string{"現在の画面: " + screen}
 	switch m.state {
 	case "updateChecking", "updateConfirm", "updatePreparing", "updateCancelling":
@@ -872,6 +889,12 @@ func (m *connectUI) openHelp() {
 	}
 	if m.updateVersion != "" {
 		lines = append(lines, "", "更新 "+m.updateVersion, "Ctrl+K → 更新でcsql内から更新", updatePage)
+	}
+	if strings.HasPrefix(m.state, "migration") {
+		lines = append(lines, "", "移行: Enter 実行前確認 / ←→・Tab 取消と取込を選択", "PgUp/PgDn 詳細 / Esc 戻る・処理取消", "認証・PATH・未保存接続は移行しません")
+	}
+	if m.migrationReport != "" {
+		lines = append(lines, "", "直近の移行結果・復元手順", m.migrationReport)
 	}
 	m.help = &helpOverlay{lines: lines}
 }
@@ -1218,6 +1241,8 @@ func (m *connectUI) beginExport(format string) {
 }
 func (m *connectUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch v := msg.(type) {
+	case uiMigrationResult:
+		return m, m.finishMigration(v)
 	case uiSelfUpdateResult:
 		return m, m.finishSelfUpdate(v)
 	case uiClipboardResult:
@@ -1437,6 +1462,9 @@ func (m *connectUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if strings.HasPrefix(m.state, "update") {
 			return m, m.selfUpdateKey(key)
+		}
+		if strings.HasPrefix(m.state, "migration") {
+			return m, m.migrationKey(v)
 		}
 		if m.exit || m.state == "saving" || m.state == "stopping" {
 			return m, nil
@@ -1774,6 +1802,9 @@ func (m *connectUI) View() string {
 	if strings.HasPrefix(m.state, "update") {
 		return m.selfUpdateView(v, width, height, tabs)
 	}
+	if strings.HasPrefix(m.state, "migration") {
+		return m.migrationView(v, width, height, tabs)
+	}
 	footer := []string{"↑↓ 選択  Enter 接続  Tab 切替  Ctrl+S 保存", "Ctrl+U 消去  Ctrl+L 注意  Esc 戻る  Ctrl+C 全接続停止"}
 	if m.state == "list" {
 		tabs = m.tabsView()
@@ -2105,6 +2136,15 @@ func (a *App) runConnectModel(ctx context.Context, request connectRequest, seed 
 	_, err = tea.NewProgram(m, tea.WithInput(a.In), tea.WithOutput(a.terminalOutput()), tea.WithContext(ctx), tea.WithoutSignalHandler(), tea.WithAltScreen()).Run()
 	m.closeWork()
 	m.workers.Wait()
+	if job := m.migrationJob; job != nil {
+		job.mu.Lock()
+		result := job.finished
+		displayed := job.displayed
+		job.mu.Unlock()
+		if result != nil && !displayed && (result.result.Committed || result.result.Backup != "") {
+			fmt.Fprintln(a.stdout(), a.migrationResultText(m.migrationKind, result.result, result.err))
+		}
+	}
 	if m.updateJob != nil {
 		m.updateJob.closePrepared()
 	}
@@ -2378,5 +2418,312 @@ func (m *connectUI) selfUpdateView(v terminalView, width, height int, tabs strin
 	if m.state != "updateConfirm" {
 		footer[0] = fmt.Sprintf("PgUp/PgDn 詳細 %d/%d", page+1, last+1)
 	}
+	return v.frame(title, tabs, badge, v.panel(title, wrapped[start:min(len(wrapped), start+size)], width, height-4), footer)
+}
+
+// 保存結果はCmdの配送前から所有し、終了時にも確定済みの副作用を報告する。
+type uiMigrationJob struct {
+	operation uint64
+	phase     string
+	cancel    context.CancelFunc
+	mu        sync.Mutex
+	finished  *uiMigrationResult
+	displayed bool
+}
+type uiMigrationResult struct {
+	operation uint64
+	job       *uiMigrationJob
+	preview   *migrationPreview
+	data      []byte
+	count     int
+	path      string
+	result    migrationResult
+	err       error
+}
+
+func (m *connectUI) migrationWork(phase string, run func(context.Context) uiMigrationResult) tea.Cmd {
+	m.migrationOperation++
+	ctx, cancel := context.WithCancel(m.ctx)
+	job := &uiMigrationJob{operation: m.migrationOperation, phase: phase, cancel: cancel}
+	m.migrationJob = job
+	cancelled := uiMigrationResult{operation: job.operation, job: job, err: context.Canceled}
+	cmd := m.work(ctx, cancelled, func() tea.Msg {
+		result := run(ctx)
+		result.operation, result.job = job.operation, job
+		job.mu.Lock()
+		job.finished = &result
+		job.mu.Unlock()
+		return result
+	})
+	return tea.Batch(cmd, m.ensureTick())
+}
+func (m *connectUI) startMigration(kind string) tea.Cmd {
+	if m.exit || m.addOnly || m.updateJob != nil || m.migrationJob != nil || (m.state != "actions" && m.state != "list" && m.state != "error") {
+		return nil
+	}
+	origin := m.captureActions()
+	if m.state == "actions" {
+		origin = m.actionOrigin
+	}
+	if origin == nil {
+		return nil
+	}
+	copy := *origin
+	m.migrationOrigin = &copy
+	m.migrationKind = kind
+	m.migrationPage = 0
+	m.migrationYes = false
+	m.message = ""
+	m.migrationPreview = nil
+	if kind == "import" {
+		m.state = "migrationPath"
+		m.fields = []formField{{label: "取込ファイル（Enterで確認・Escで戻る）"}}
+		m.focus = 0
+		return nil
+	}
+	m.state = "migrationPreparing"
+	a := m.a
+	return m.migrationWork("export-prepare", func(ctx context.Context) uiMigrationResult {
+		data, count, err := a.prepareMigrationExport()
+		path := ""
+		if err == nil {
+			path, err = a.defaultMigrationOutput()
+		}
+		if err == nil {
+			err = ctx.Err()
+		}
+		return uiMigrationResult{data: data, count: count, path: path, err: err}
+	})
+}
+func (m *connectUI) restoreMigration(message string) {
+	if b := m.migrationOrigin; b != nil {
+		loc := b.location
+		m.location = &loc
+		m.returnToList()
+		if b.state == "error" || b.state == "connecting" {
+			m.state = b.state
+		}
+	}
+	m.message = message
+	m.migrationPreview = nil
+	m.migrationData = nil
+	m.migrationPage = 0
+}
+func (m *connectUI) finishMigration(v uiMigrationResult) tea.Cmd {
+	if m.exit || m.ctx.Err() != nil || v.operation != m.migrationOperation || m.migrationJob != v.job || v.job == nil {
+		return nil
+	}
+	job := v.job
+	job.cancel()
+	job.mu.Lock()
+	job.displayed = true
+	job.mu.Unlock()
+	m.migrationJob = nil
+	cancelled := m.state == "migrationCancelling"
+	if v.result.Committed {
+		report := m.a.migrationResultText(m.migrationKind, v.result, v.err)
+		if m.migrationKind == "import" {
+			rows, err := m.a.LoadProfiles()
+			if err != nil {
+				report += "\n取込は完了しましたが一覧の再読込に失敗しました: " + safeLog(err.Error())
+			} else {
+				m.profiles = rows
+			}
+		}
+		m.migrationReport = report
+		m.restoreMigration(report + "\nF1で結果・復元手順を確認できます")
+		return nil
+	}
+	if cancelled {
+		text := "移行を取り消しました。接続は維持しています"
+		if v.result.Backup != "" {
+			text = m.a.migrationResultText(m.migrationKind, v.result, v.err)
+			m.migrationReport = text
+		}
+		m.restoreMigration(text)
+		return nil
+	}
+	if v.err != nil {
+		m.message = m.a.migrationResultText(m.migrationKind, v.result, v.err)
+		if v.result.Backup != "" {
+			m.migrationReport = m.message
+		}
+		if job.phase == "export-prepare" {
+			m.restoreMigration(m.message)
+		} else {
+			m.state = "migrationPath"
+			m.migrationPage = 0
+		}
+		return nil
+	}
+	switch job.phase {
+	case "export-prepare":
+		m.migrationData, m.migrationCount = v.data, v.count
+		m.state = "migrationPath"
+		m.fields = []formField{{label: "出力パス（Enterで保存・Escで戻る）", value: v.path, pos: len([]rune(v.path))}}
+		m.focus = 0
+	case "preview":
+		m.migrationPreview = v.preview
+		m.migrationYes = false
+		m.migrationPage = 0
+		if len(v.preview.Conflicts) == 0 && len(v.preview.Added) == 0 {
+			m.restoreMigration(fmt.Sprintf("変更なし（同一 %d件）", len(v.preview.Identical)))
+			return nil
+		}
+		m.state = "migrationConfirm"
+		m.message = ""
+	}
+	return nil
+}
+func (m *connectUI) migrationPath(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if len(value) >= 2 && ((value[0] == '\'' && value[len(value)-1] == '\'') || (value[0] == '"' && value[len(value)-1] == '"')) {
+		value = value[1 : len(value)-1]
+	}
+	if value == "" {
+		return "", fmt.Errorf("移行ファイルのパスを入力してください")
+	}
+	if strings.HasPrefix(value, "~/") || strings.HasPrefix(value, "~\\") {
+		home := m.a.Env("HOME")
+		if home == "" {
+			var err error
+			home, err = os.UserHomeDir()
+			if err != nil {
+				return "", err
+			}
+		}
+		value = filepath.Join(home, value[2:])
+	} else if strings.HasPrefix(value, "~") {
+		return "", fmt.Errorf("~他ユーザーは展開しません。絶対パスを入力してください")
+	}
+	return filepath.Abs(value)
+}
+func (m *connectUI) migrationKey(key tea.KeyMsg) tea.Cmd {
+	k := key.String()
+	switch k {
+	case "pgup":
+		m.migrationPage = max(0, m.migrationPage-1)
+		return nil
+	case "pgdown":
+		m.migrationPage++
+		return nil
+	case "esc":
+		if m.migrationJob != nil {
+			m.migrationJob.cancel()
+			m.state = "migrationCancelling"
+			return nil
+		}
+		if m.state == "migrationConfirm" {
+			m.state = "migrationPath"
+			m.migrationPage = 0
+			return nil
+		}
+		m.restoreMigration("")
+		return nil
+	}
+	if m.migrationJob != nil {
+		return nil
+	}
+	if m.state == "migrationConfirm" {
+		p := m.migrationPreview
+		if k == "tab" || k == "left" || k == "right" || k == "up" || k == "down" {
+			if len(p.Conflicts) == 0 {
+				m.migrationYes = !m.migrationYes
+			}
+			return nil
+		}
+		if k == "enter" {
+			if !m.migrationYes {
+				m.restoreMigration("取込を取り消しました")
+				return nil
+			}
+			if len(p.Conflicts) > 0 {
+				return nil
+			}
+			m.state = "migrationApplying"
+			a := m.a
+			return m.migrationWork("apply", func(ctx context.Context) uiMigrationResult {
+				result, err := a.applyMigration(ctx, p)
+				return uiMigrationResult{result: result, err: err}
+			})
+		}
+		return nil
+	}
+	if m.state == "migrationPath" && len(m.fields) > 0 {
+		if k == "enter" {
+			path, err := m.migrationPath(m.fields[0].value)
+			if err != nil {
+				m.message = err.Error()
+				return nil
+			}
+			m.fields[0].value = path
+			m.fields[0].pos = len([]rune(path))
+			m.migrationPage = 0
+			m.message = ""
+			a := m.a
+			if m.migrationKind == "import" {
+				m.state = "migrationPreparing"
+				return m.migrationWork("preview", func(ctx context.Context) uiMigrationResult {
+					p, err := a.previewMigration(ctx, path)
+					return uiMigrationResult{preview: p, err: err}
+				})
+			}
+			data, count := m.migrationData, m.migrationCount
+			m.state = "migrationApplying"
+			return m.migrationWork("export", func(ctx context.Context) uiMigrationResult {
+				result, err := a.exportMigration(ctx, path, data, count)
+				return uiMigrationResult{result: result, err: err}
+			})
+		}
+		if editText(&m.fields[0].value, &m.fields[0].pos, key) {
+			m.migrationPage = 0
+		}
+	}
+	return nil
+}
+func (m *connectUI) migrationView(v terminalView, width, height int, tabs string) string {
+	title := "移行ファイルの取込"
+	if m.migrationKind == "export" {
+		title = "移行ファイルの書出し"
+	}
+	badge, lines := "準備中", []string{"設定を確認しています。接続は維持しています"}
+	if m.state == "migrationPath" {
+		badge = "パス入力"
+		lines = []string{m.fields[0].label, inputView(m.fields[0].value, m.fields[0].pos, width-8)}
+		if m.migrationKind == "export" {
+			lines = append(lines, fmt.Sprintf("対象: 保存済み %d件", m.migrationCount), "プロジェクト・DBユーザー名を含みます。認証やパスワードは含みません", "既存の出力ファイルは上書きしません")
+		}
+		if m.message != "" {
+			lines = append(lines, "", m.message)
+		}
+	}
+	if m.state == "migrationConfirm" {
+		badge = "実行前確認"
+		choice := "[取消]   取り込む"
+		if m.migrationYes {
+			choice = "取消   [取り込む]"
+		}
+		if len(m.migrationPreview.Conflicts) > 0 {
+			choice = "競合があるため取込不可（Escで入力へ戻る）"
+		}
+		lines = []string{choice, "", migrationPreviewText(m.migrationPreview)}
+	}
+	if m.state == "migrationApplying" {
+		badge = "保存中"
+		lines = []string{"ファイル操作の完了を待っています。接続は維持しています"}
+	}
+	if m.state == "migrationCancelling" {
+		badge = "取消中"
+		lines = []string{"取消処理の完了を待っています。保存確定後なら結果を表示します"}
+	}
+	var wrapped []string
+	for _, line := range lines {
+		wrapped = append(wrapped, strings.Split(ansi.Wrap(safeLog(line), width-4, ""), "\n")...)
+	}
+	size := max(1, height-6)
+	last := max(0, (len(wrapped)-1)/size)
+	page := min(m.migrationPage, last)
+	start := page * size
+	footer := []string{fmt.Sprintf("Enter 確認/実行  Tab 取消/取込  PgUp/PgDn %d/%d", page+1, last+1), "Esc 戻る/取消  F1 ヘルプ  Ctrl+C 全接続停止"}
 	return v.frame(title, tabs, badge, v.panel(title, wrapped[start:min(len(wrapped), start+size)], width, height-4), footer)
 }

@@ -426,7 +426,7 @@ func TestConnectionsAddSwitchAndStop(t *testing.T) {
 		awaitProxyPort(t, row.Port)
 	}
 	h.key("esc")
-	h.m.updateVersion = "v0.8.0"
+	h.m.updateVersion = "v0.9.0"
 	if !strings.Contains(h.m.View(), "稼働 2件") {
 		t.Fatal("更新通知で稼働件数を喪失")
 	}
@@ -1111,7 +1111,7 @@ func TestConnectionsSelfUpdate(t *testing.T) {
 				t.Fatal("検索0件の共通更新が開かない", h.m.state)
 			}
 			h.pumpUntil(func() bool { return h.m.state == "updateConfirm" }, "更新確認")
-			if !strings.Contains(h.m.View(), "0.8.0") {
+			if !strings.Contains(h.m.View(), "0.9.0") {
 				t.Fatal("版の確認がない")
 			}
 			if mode == "decline" {
@@ -1325,5 +1325,279 @@ func TestConnectionsSelfUpdateDeliveryContract(t *testing.T) {
 				t.Fatal("取消/未配送の結果が配置を変更")
 			}
 		})
+	}
+}
+
+// 行の選択に依存しない移行操作と、確認・取消・一覧への反映を実キーで通す。
+func TestConnectionsMigration(t *testing.T) {
+	a, _, _ := testApp(t)
+	h := newConnectionsHarness(t, a)
+	h.m.tab = tabProfiles
+	h.m.selector.query = "一致なし"
+	source := migrationFile(t, migrationData(t, migrationRows()))
+	open := func(kind string) {
+		t.Helper()
+		h.key("ctrl+k")
+		h.key("migration " + kind)
+		h.key("enter")
+		if kind == "export" {
+			h.pumpUntil(func() bool { return h.m.state == "migrationPath" }, "出力パス")
+		} else if h.m.state != "migrationPath" {
+			t.Fatalf("選択0件の共通入口: %s", h.m.state)
+		}
+	}
+	input := func(path string) {
+		t.Helper()
+		h.m.fields[0].value = path
+		h.m.fields[0].pos = len([]rune(path))
+		h.key("enter")
+		h.pumpUntil(func() bool { return h.m.state == "migrationConfirm" || h.m.state == "list" }, "取込確認")
+	}
+	open("import")
+	input("'" + source + "'")
+	h.update(tea.WindowSizeMsg{Width: 60, Height: 16})
+	h.key("pgdown")
+	h.key("f1")
+	if !strings.Contains(h.m.View(), "操作ヘルプ") {
+		t.Fatal("移行help")
+	}
+	h.key("esc")
+	h.key("enter")
+	if h.m.state != "list" {
+		t.Fatal("既定取消で一覧へ戻らない")
+	}
+	if _, err := os.Stat(a.Paths.ConfigDir); !os.IsNotExist(err) {
+		t.Fatal("取消で書込み")
+	}
+	open("import")
+	input(source)
+	h.key("tab")
+	h.key("enter")
+	h.pumpUntil(func() bool { return h.m.state == "list" }, "取込完了")
+	if len(h.m.profiles) != 2 || h.m.selector.query != "一致なし" {
+		t.Fatal("保存一覧/検索が復元されない")
+	}
+	h.key("f1")
+	if !strings.Contains(strings.Join(h.m.help.lines, "\n"), "取り込みました") {
+		t.Fatal("完了結果をhelpで確認できない")
+	}
+	h.key("esc")
+	open("export")
+	output := filepath.Join(filepath.Dir(source), "exported.json")
+	h.m.fields[0].value = output
+	h.m.fields[0].pos = len([]rune(output))
+	h.key("enter")
+	h.pumpUntil(func() bool { return h.m.state == "list" }, "出力完了")
+	if _, err := os.Stat(output); err != nil {
+		t.Fatal(err)
+	}
+	open("import")
+	h.m.fields[0].value = source + ".absent"
+	h.key("enter")
+	h.pumpUntil(func() bool { return h.m.state == "migrationPath" }, "入力失敗")
+	input(source)
+	h.pumpUntil(func() bool { return h.m.state == "list" }, "同一再取込")
+	for _, prefix := range []string{"~/", "~\\"} {
+		home := filepath.Dir(source)
+		a.Env = func(k string) string {
+			if k == "HOME" {
+				return home
+			}
+			return ""
+		}
+		open("import")
+		input(prefix + filepath.Base(source))
+		if h.m.state != "list" {
+			t.Fatal("ホーム展開の再取込")
+		}
+	}
+	h.m.addOnly = true
+	h.key("ctrl+k")
+	for _, action := range h.m.availableActions() {
+		if strings.HasPrefix(action.ID, "migration-") {
+			t.Fatal("保存専用画面で移行が有効")
+		}
+	}
+}
+
+// 書込み確定の前後で取消し、未配送結果と再試行の所有を確かめる。
+func TestConnectionsMigrationLifecycle(t *testing.T) {
+	for _, mode := range []string{"cancel-before-save", "cancel-after-save", "undelivered-exit", "outer-cancel"} {
+		t.Run(mode, func(t *testing.T) {
+			a, _, _ := testApp(t)
+			if err := a.writeProfiles(migrationRows()); err != nil {
+				t.Fatal(err)
+			}
+			h := newConnectionsHarness(t, a)
+			incoming := migrationRows()[0]
+			incoming.Name = "imported"
+			source := migrationFile(t, migrationData(t, []Profile{incoming}))
+			h.key("ctrl+k")
+			h.key("migration import")
+			h.key("enter")
+			h.m.fields[0].value = source
+			h.key("enter")
+			h.pumpUntil(func() bool { return h.m.state == "migrationConfirm" }, "確認")
+			entered, gate := make(chan struct{}), make(chan struct{})
+			defer func() {
+				select {
+				case <-gate:
+				default:
+					close(gate)
+				}
+			}()
+			if mode == "cancel-before-save" {
+				a.MigrationOps = &migrationFileOps{Backup: func(dir string, b []byte) (string, error) {
+					path, err := backupMigration(dir, b)
+					close(entered)
+					<-gate
+					return path, err
+				}}
+			} else {
+				a.MigrationOps = &migrationFileOps{Save: func(rows []Profile) error { close(entered); <-gate; return a.writeProfiles(rows) }}
+			}
+			h.key("tab")
+			h.key("enter")
+			select {
+			case <-entered:
+			case <-time.After(5 * time.Second):
+				t.Fatal("保存待機")
+			}
+			job := h.m.migrationJob
+			if mode == "cancel-before-save" || mode == "cancel-after-save" {
+				h.key("esc")
+				if h.m.state != "migrationCancelling" {
+					t.Fatal("取消待機なし")
+				}
+				h.key("ctrl+k")
+				if h.m.migrationJob != job {
+					t.Fatal("取消中の新操作")
+				}
+			}
+			close(gate)
+			if mode == "undelivered-exit" || mode == "outer-cancel" {
+				// 結果が配送される前に実workerの確定を待つ。
+				h.m.workers.Wait()
+				job.mu.Lock()
+				done := job.finished
+				job.mu.Unlock()
+				if done == nil || !done.result.Committed {
+					t.Fatal("配送前に結果を保持していない")
+				}
+				if mode == "outer-cancel" {
+					h.m.cancelAll()
+				} else {
+					h.key("ctrl+c")
+				}
+				h.m.workers.Wait()
+				h.update(*done)
+				job.mu.Lock()
+				displayed := job.displayed
+				job.mu.Unlock()
+				if displayed {
+					t.Fatal("終了画面が結果を表示済みとして破棄")
+				}
+				return
+			}
+			h.pumpUntil(func() bool { return h.m.state == "list" }, "取消/保存の完了")
+			rows, err := a.LoadProfiles()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if mode == "cancel-before-save" {
+				if len(rows) != 2 || !strings.Contains(h.m.migrationReport, "バックアップ") {
+					t.Fatal("未確定で保存/backup消失")
+				}
+			} else {
+				if len(rows) != 3 || !strings.Contains(h.m.migrationReport, "取り込みました") {
+					t.Fatal("確定済み結果を取消と誤表示")
+				}
+			}
+			// 古い結果を次のoperationへ配送しても画面を変更しない。
+			h.key("ctrl+k")
+			h.key("migration import")
+			h.key("enter")
+			job.mu.Lock()
+			old := *job.finished
+			job.mu.Unlock()
+			h.update(old)
+			if h.m.state != "migrationPath" {
+				t.Fatal("古い結果が新操作へ適用")
+			}
+			h.m.fields[0].value = source
+			h.key("enter")
+			h.pumpUntil(func() bool { return h.m.state == "migrationConfirm" || h.m.state == "list" }, "再試行")
+			if mode == "cancel-before-save" {
+				h.key("tab")
+				a.MigrationOps = nil
+				h.key("enter")
+				h.pumpUntil(func() bool { return h.m.state == "list" }, "再取込")
+			}
+		})
+	}
+}
+
+// 通常の移行は、自画面2本と別所有の実fixtureセッションを停止しない。
+func TestConnectionsMigrationLive(t *testing.T) {
+	t.Setenv("CSQL_TEST_BIND", "1")
+	a := proxyApp(t)
+	h := newConnectionsHarness(t, a)
+	h.key("enter")
+	h.until("Proxy利用可能")
+	h.command(h.m.startConnection(Profile{Instance: h.m.selector.rows[1]}))
+	h.pumpUntil(func() bool {
+		return len(h.m.connections) == 2 && h.m.connections[0].status() == "Proxy利用可能" && h.m.connections[1].status() == "Proxy利用可能"
+	}, "2接続")
+	external := proxyApp(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- external.Connect(ctx, testInstance(), ConnectOptions{}) }()
+	awaitSession(t, external)
+	defer func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Error("外部fixture終了待機")
+		}
+	}()
+	source := migrationFile(t, migrationData(t, migrationRows()))
+	h.key("ctrl+k")
+	h.key("migration import")
+	h.key("enter")
+	h.m.fields[0].value = source
+	h.key("enter")
+	h.pumpUntil(func() bool { return h.m.state == "migrationConfirm" }, "稼働中の確認")
+	h.key("tab")
+	h.key("enter")
+	h.pumpUntil(func() bool { return h.m.state == "list" }, "稼働中の取込")
+	if rows, _ := a.Status(context.Background()); len(rows) != 2 {
+		t.Fatal("自画面の接続を停止")
+	}
+	if rows, _ := external.Status(context.Background()); len(rows) != 1 {
+		t.Fatal("外部接続を停止")
+	}
+	for _, c := range h.m.connections {
+		if c.profile.Username != "" || !c.running {
+			t.Fatal("取込が稼働中の接続を書き換えた")
+		}
+	}
+	h.key("ctrl+k")
+	h.key("migration export")
+	h.key("enter")
+	h.pumpUntil(func() bool { return h.m.state == "migrationPath" }, "稼働中の出力")
+	h.m.fields[0].value = filepath.Join(filepath.Dir(source), "running-export.json")
+	h.key("enter")
+	h.pumpUntil(func() bool { return h.m.state == "list" }, "出力完了")
+	if rows, _ := a.Status(context.Background()); len(rows) != 2 {
+		t.Fatal("出力で接続停止")
+	}
+	h.key("ctrl+c")
+	h.m.workers.Wait()
+	if rows, _ := a.Status(context.Background()); len(rows) != 0 {
+		t.Fatal("Ctrl+Cで自画面の接続が残った")
+	}
+	if rows, _ := external.Status(context.Background()); len(rows) != 1 {
+		t.Fatal("Ctrl+Cが外部に波及")
 	}
 }

@@ -54,6 +54,7 @@ type App struct {
 	ConfirmAction                         func(context.Context, string) (bool, error)
 	CopyText                              func(context.Context, string) error
 	SelfUpdateOps                         *selfUpdateFileOps
+	MigrationOps                          *migrationFileOps
 	RestartSelf                           func(string) error
 }
 type synchronizedWriter struct {
@@ -83,7 +84,7 @@ func NewApp() *App {
 	return &App{Paths: Paths{filepath.Join(c, "csql"), filepath.Join(cache, "csql"), filepath.Join(c, "csql", "tools")}, In: os.Stdin, Out: os.Stdout, Err: os.Stderr, TTY: term.IsTerminal(os.Stdin.Fd()) && term.IsTerminal(os.Stdout.Fd()), OS: runtime.GOOS, Arch: runtime.GOARCH, Runner: osRunner{}, LookPath: exec.LookPath, Env: os.Getenv, Now: time.Now, QueryTimeout: 60 * time.Second, CheckTimeout: 10 * time.Second, StopGrace: 10 * time.Second, StartupTimeout: 60 * time.Second}
 }
 
-const version = "0.7.0"
+const version = "0.8.0"
 
 var ErrCancelled = errors.New("操作を取り消しました")
 
@@ -200,6 +201,7 @@ func (a *App) Run(ctx context.Context, args []string) int {
 	connectFlags(c)
 	root.AddCommand(c)
 	root.AddCommand(a.profileCommand())
+	root.AddCommand(a.migrationCommand())
 	root.AddCommand(&cobra.Command{Use: "update", Short: "確認してcsql本体を最新版へ更新", Args: argCount(0, 0), RunE: func(c *cobra.Command, _ []string) error { return a.UpdateSelf(c.Context()) }})
 	l := &cobra.Command{Use: "list [検索文字列]", Short: "インスタンス一覧", Args: argCount(0, 1), RunE: func(cmd *cobra.Command, args []string) error {
 		p, _ := cmd.Flags().GetString("project")
