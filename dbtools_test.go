@@ -470,6 +470,24 @@ func TestDBToolRegistrationDBeaverPending(t *testing.T) {
 	if err != nil || history.Entries[plan.ID].Status != "already-present" {
 		t.Fatal("履歴が解決されない")
 	}
+	// 通常のCLI再実行も、表示だけでなくunknown履歴を再送なしで解消する。
+	history.Entries[plan.ID] = dbToolRegistrationResult{Status: "unknown", Committed: true, Backup: r.Backup}
+	if err := a.writeDBToolReceipt(history); err != nil {
+		t.Fatal(err)
+	}
+	files, _ := filepath.Glob(filepath.Join(w, "General/.dbeaver/data-sources-csql-*.json"))
+	before, _ := os.ReadFile(files[0])
+	if code := a.Run(context.Background(), []string{"profile", "register", p.Name, "--tool", "dbeaver", "--executable", exe, "--dbeaver-workspace", w}); code != 0 {
+		t.Fatalf("CLI再照合: %s", a.Err)
+	}
+	history, err = a.readDBToolReceipt()
+	if err != nil || history.Entries[plan.ID].Status != "already-present" {
+		t.Fatal("CLIがunknown履歴を解消しない")
+	}
+	after, _ := os.ReadFile(files[0])
+	if string(before) != string(after) || history.Entries[plan.ID].Submitted {
+		t.Fatal("再照合で外部変更を再送")
+	}
 }
 
 func TestDBToolRegistrationWindowsPGAdminDetection(t *testing.T) {

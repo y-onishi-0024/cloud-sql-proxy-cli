@@ -501,8 +501,10 @@ func (a *App) profileRegisterCommand() *cobra.Command {
 			return fmt.Errorf("既存設定との競合を解消してください")
 		}
 		if plan.Disposition == "already-present" {
-			fmt.Fprintln(a.stdout(), "同じ設定を登録済みです。変更はありません")
-			return nil
+			// 実保存先の再検査へ通し、要求後に残ったunknown履歴も再送せず解消する。
+			result, err := a.applyDBToolRegistration(c.Context(), plan)
+			fmt.Fprintln(a.stdout(), dbToolResultText(result, err))
+			return err
 		}
 		yes, err := a.confirm(c.Context(), "表示した登録先へ追加しますか？ [y/N]")
 		if err != nil {
