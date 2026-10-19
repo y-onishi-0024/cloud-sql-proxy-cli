@@ -1,11 +1,13 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -383,5 +385,77 @@ func TestMigrationCLI(t *testing.T) {
 		if code := a.Run(context.Background(), args); code != 2 {
 			t.Fatalf("引数拒否 %v: %d", args, code)
 		}
+	}
+}
+
+// 別CLIの保存が移行のロックを待ち、両方の追加が失われないことを観測する。
+func TestMigrationConcurrentProcess(t *testing.T) {
+	a, _, _ := testApp(t)
+	rows := migrationRows()
+	for i := range rows {
+		rows[i].Port = 55435
+	}
+	if err := a.writeProfiles(rows); err != nil {
+		t.Fatal(err)
+	}
+	incoming := rows[0]
+	incoming.Name = "imported"
+	p, err := a.previewMigration(context.Background(), migrationFile(t, migrationData(t, []Profile{incoming})))
+	if err != nil {
+		t.Fatal(err)
+	}
+	entered, gate := make(chan struct{}), make(chan struct{})
+	defer func() {
+		select {
+		case <-gate:
+		default:
+			close(gate)
+		}
+	}()
+	a.MigrationOps = &migrationFileOps{Backup: func(dir string, b []byte) (string, error) {
+		name, err := backupMigration(dir, b)
+		close(entered)
+		<-gate
+		return name, err
+	}}
+	done := make(chan error, 1)
+	go func() { _, err := a.applyMigration(context.Background(), p); done <- err }()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("ロック待ち")
+	}
+	exe, _ := os.Executable()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, exe, "-test.run=^TestProfilesConcurrentProcesses$")
+	cmd.Env = append(os.Environ(), "CSQL_PROFILE_WORKER=one", "CSQL_PROFILE_DIR="+a.Paths.ConfigDir)
+	pipe, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	ready := make(chan bool, 1)
+	go func() { ready <- bufio.NewScanner(pipe).Scan() }()
+	select {
+	case ok := <-ready:
+		if !ok {
+			t.Fatal("別CLI未起動")
+		}
+	case <-ctx.Done():
+		t.Fatal("別CLI待機")
+	}
+	close(gate)
+	if err = <-done; err != nil {
+		t.Fatal(err)
+	}
+	if err = cmd.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	actual, err := a.LoadProfiles()
+	if err != nil || len(actual) != 4 {
+		t.Fatalf("追加を喪失: %+v %v", actual, err)
 	}
 }

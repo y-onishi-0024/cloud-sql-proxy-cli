@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"github.com/spf13/cobra"
 	"io"
@@ -402,7 +403,13 @@ func (a *App) migrationResultText(kind string, r migrationResult, err error) str
 		}
 		lines = append(lines, "新PCの準備: csql doctor / csql setup（不足ツールの導入は csql setup --install）", "Googleログインはdoctor/setupの案内に従って実行してください。認証は移行していません", "DBツールの設定は、新PCでCtrl+Eから必要な形式へ再出力してください")
 	} else if err != nil {
-		lines = append(lines, "移行処理は完了していません: "+err.Error())
+		message := err.Error()
+		if errors.Is(err, context.Canceled) {
+			message = "確定前に取り消しました。元の設定は変更していません"
+		} else if errors.Is(err, context.DeadlineExceeded) {
+			message = "待機時間を超えました。ほかの設定保存が完了してから再試行してください"
+		}
+		lines = append(lines, "移行処理は完了していません: "+message)
 	} else {
 		lines = append(lines, fmt.Sprintf("変更なし（同一 %d件）", r.Identical))
 	}
