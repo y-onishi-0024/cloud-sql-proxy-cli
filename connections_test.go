@@ -81,6 +81,8 @@ func (h *connectionsHarness) key(key string) {
 		msg.Type = tea.KeyF1
 	case "f2":
 		msg.Type = tea.KeyF2
+	case "f3":
+		msg.Type = tea.KeyF3
 	case "ctrl+k":
 		msg.Type = tea.KeyCtrlK
 	case "up":
@@ -1399,6 +1401,95 @@ func TestConnectionsSelfUpdateDeliveryContract(t *testing.T) {
 	}
 }
 
+// 新PCの空の一覧でも移行でき、検索中の1行だけを誤って書き出さない。
+func TestConnectionsTopLevelMigration(t *testing.T) {
+	for _, tab := range []connectionTab{tabInstances, tabProfiles, tabConnections} {
+		t.Run(fmt.Sprint(tab), func(t *testing.T) {
+			a, _, _ := testApp(t)
+			h := newConnectionsHarness(t, a)
+			h.m.tab = tab
+			h.m.selector.rows = nil
+			h.m.selector.query = "一致なし"
+			for _, width := range []int{60, 100} {
+				h.update(tea.WindowSizeMsg{Width: width, Height: 16})
+				view := h.m.View()
+				for _, label := range []string{"F1 ヘルプ", "F2 csqlを更新", "F3 データ移行", "Ctrl+C 全接続停止"} {
+					if !strings.Contains(view, label) {
+						t.Fatalf("%d列の一覧で%sが見えない: %s", width, label, view)
+					}
+				}
+			}
+			h.key("f3")
+			if !strings.Contains(h.m.View(), "全接続先を書き出す") || !strings.Contains(h.m.View(), "移行ファイルを取り込む") {
+				t.Fatal("接続先なしで移行メニューを開けない", h.m.View())
+			}
+			h.key("down")
+			h.key("enter")
+			if h.m.state != "migrationPath" || h.m.migrationKind != "import" {
+				t.Fatal("新PCで取込パスへ進めない", h.m.state)
+			}
+			h.key("esc")
+			if h.m.state != "list" || h.m.tab != tab || h.m.selector.query != "一致なし" || len(h.m.connections) != 0 {
+				t.Fatal("取消後に元の未接続一覧へ戻らない")
+			}
+			if _, err := os.Stat(a.Paths.ConfigDir); !os.IsNotExist(err) {
+				t.Fatal("取込前に設定を書き込んだ", err)
+			}
+			// 保存全件の出力を、検索結果0件のまま開始する。
+			rows := migrationRows()
+			if err := a.writeProfiles(rows); err != nil {
+				t.Fatal(err)
+			}
+			h.m.profiles = rows
+			h.key("f3")
+			h.key("enter")
+			h.pumpUntil(func() bool { return h.m.state == "migrationPath" }, "全件の出力パス")
+			doc, err := decodeMigration(h.m.migrationData)
+			if err != nil || len(doc.Profiles) != len(rows) || !strings.Contains(h.m.View(), "全件") {
+				t.Fatal("検索や選択で全件出力の対象が減った", doc, err, h.m.View())
+			}
+			h.key("esc")
+		})
+	}
+	t.Run("search-error", func(t *testing.T) {
+		a, _, _ := testApp(t)
+		h := newConnectionsHarness(t, a)
+		h.m.fail(fmt.Errorf("検索できません"), "local")
+		h.key("ctrl+l")
+		h.key("f3")
+		h.key("down")
+		h.key("enter")
+		if h.m.state != "migrationPath" {
+			t.Fatal("依存未導入・認証失敗時に取込できない")
+		}
+		h.key("esc")
+		if h.m.state != "error" || !strings.Contains(h.m.View(), "検索できません") {
+			t.Fatal("取消で検索エラーが失われた")
+		}
+	})
+	for _, mode := range []string{"add-only", "form", "help", "small"} {
+		t.Run(mode, func(t *testing.T) {
+			a, _, _ := testApp(t)
+			h := newConnectionsHarness(t, a)
+			switch mode {
+			case "add-only":
+				h.m.addOnly = true
+			case "form":
+				h.m.openForm(Profile{Instance: testInstance()})
+			case "help":
+				h.key("f1")
+			case "small":
+				h.update(tea.WindowSizeMsg{Width: 59, Height: 15})
+			}
+			before := h.m.View()
+			h.key("f3")
+			if h.m.View() != before || (mode != "help" && strings.Contains(before, "F3 データ移行")) {
+				t.Fatal("対象外の画面で移行を開始・案内した")
+			}
+		})
+	}
+}
+
 // 行の選択に依存しない移行操作と、確認・取消・一覧への反映を実キーで通す。
 func TestConnectionsMigration(t *testing.T) {
 	a, _, _ := testApp(t)
@@ -1633,8 +1724,8 @@ func TestConnectionsMigrationLive(t *testing.T) {
 		}
 	}()
 	source := migrationFile(t, migrationData(t, migrationRows()))
-	h.key("ctrl+k")
-	h.key("migration import")
+	h.key("f3")
+	h.key("down")
 	h.key("enter")
 	h.m.fields[0].value = source
 	h.key("enter")
@@ -1653,8 +1744,7 @@ func TestConnectionsMigrationLive(t *testing.T) {
 			t.Fatal("取込が稼働中の接続を書き換えた")
 		}
 	}
-	h.key("ctrl+k")
-	h.key("migration export")
+	h.key("f3")
 	h.key("enter")
 	h.pumpUntil(func() bool { return h.m.state == "migrationPath" }, "稼働中の出力")
 	h.m.fields[0].value = filepath.Join(filepath.Dir(source), "running-export.json")
