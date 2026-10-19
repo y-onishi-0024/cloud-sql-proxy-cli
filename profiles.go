@@ -71,55 +71,63 @@ func realParents(path string) error {
 	return nil
 }
 func (a *App) LoadProfiles() ([]Profile, error) {
+	rows, _, err := a.loadProfilesSnapshot()
+	return rows, err
+}
+
+// 確認時の行と原本を同じ読込で捕捉し、移行の再検査とバックアップに渡す。
+func (a *App) loadProfilesSnapshot() ([]Profile, pathFile, error) {
 	file := filepath.Join(a.Paths.ConfigDir, "profiles.json")
+	snapshot := pathFile{Path: file, Mode: 0600}
 	if err := realParents(filepath.Dir(file)); err != nil {
-		return nil, err
+		return nil, snapshot, err
 	}
 	fi, err := os.Lstat(file)
 	if os.IsNotExist(err) {
-		return nil, nil
+		return nil, snapshot, nil
 	}
 	if err != nil {
-		return nil, err
+		return nil, snapshot, err
 	}
 	if !fi.Mode().IsRegular() || fi.Size() > profileLimit {
-		return nil, fmt.Errorf("設定が通常ファイルでないか1MiBを超えています: %s", file)
+		return nil, snapshot, fmt.Errorf("設定が通常ファイルでないか1MiBを超えています: %s", file)
 	}
 	f, err := os.Open(file)
 	if err != nil {
-		return nil, err
+		return nil, snapshot, err
 	}
 	defer f.Close()
 	actual, err := f.Stat()
 	if err != nil {
-		return nil, err
+		return nil, snapshot, err
 	}
 	if !os.SameFile(fi, actual) {
-		return nil, fmt.Errorf("読込み中に設定が変わりました: %s", file)
+		return nil, snapshot, fmt.Errorf("読込み中に設定が変わりました: %s", file)
 	}
 	b, err := io.ReadAll(io.LimitReader(f, profileLimit+1))
 	if err != nil {
-		return nil, err
+		return nil, snapshot, err
 	}
+	snapshot.Before, snapshot.Mode, snapshot.Exists = b, fi.Mode().Perm(), true
 	var store profileStore
 	decoder := json.NewDecoder(bytes.NewReader(b))
 	decoder.DisallowUnknownFields()
 	if len(b) > profileLimit || decoder.Decode(&store) != nil || decoder.Decode(new(any)) != io.EOF || store.Version != 1 {
-		return nil, fmt.Errorf("プロファイル設定が不正です。ファイルを退避・修復してください: %s", file)
+		return nil, snapshot, fmt.Errorf("プロファイル設定が不正です。ファイルを退避・修復してください: %s", file)
 	}
 	names, ports, instances := map[string]bool{}, map[int]string{}, map[string]int{}
 	for _, p := range store.Profiles {
 		if err := validateProfile(p); err != nil {
-			return nil, fmt.Errorf("%s: %w", file, err)
+			return nil, snapshot, fmt.Errorf("%s: %w", file, err)
 		}
 		if names[p.Name] || (ports[p.Port] != "" && ports[p.Port] != p.ConnectionName) || (instances[p.ConnectionName] != 0 && instances[p.ConnectionName] != p.Port) {
-			return nil, fmt.Errorf("プロファイルの名前・Port予約が矛盾しています: %s", file)
+			return nil, snapshot, fmt.Errorf("プロファイルの名前・Port予約が矛盾しています: %s", file)
 		}
 		names[p.Name] = true
 		ports[p.Port] = p.ConnectionName
 		instances[p.ConnectionName] = p.Port
 	}
-	return store.Profiles, nil
+	return store.Profiles, snapshot, nil
 }
 
 // 設定更新とProxy起動で同じ排他を使い、予約参照から管理記録公開までを保護する。
