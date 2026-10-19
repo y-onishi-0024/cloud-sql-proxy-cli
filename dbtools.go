@@ -41,8 +41,8 @@ type dbToolRegistrationPlan struct {
 	ID                                           string
 }
 type dbToolRegistrationResult struct {
-	Status, Name, Target, Backup, Detail string
-	Submitted, Committed, Verified       bool
+	Status, Name, Target, Backup, Detail, Fingerprint string
+	Submitted, Committed, Verified                    bool
 }
 type dbToolReceipt struct {
 	Version int
@@ -275,7 +275,12 @@ func (a *App) detectDBTool(o dbToolOptions) (dbToolTarget, error) {
 			return t, err
 		}
 	}
-	t.Identity = dbToolHash([]string{a.OS, t.Tool, t.Executable, t.Store, t.User, t.Project})
+	// 実行ファイルの配置変更でpendingを迂回させない。IDは保存先へ束縛する。
+	storeIdentity := filepath.Clean(t.Store)
+	if a.OS == "windows" {
+		storeIdentity = strings.ToLower(storeIdentity)
+	}
+	t.Identity = dbToolHash([]string{a.OS, t.Tool, storeIdentity, t.User, t.Project})
 	return t, nil
 }
 
@@ -445,9 +450,9 @@ func (a *App) planDBToolRegistration(ctx context.Context, p Profile, o dbToolOpt
 }
 func (a *App) dbToolPlanText(p *dbToolRegistrationPlan) string {
 	disposition := map[string]string{"add": "追加予定", "already-present": "同じ設定を登録済み（変更なし）", "conflict": "同名/IDの設定と競合。ツール側で変更するか別の保存名を使用", "needs-inspection": "確認後にスキーマ・重複を検査"}[p.Disposition]
-	text := fmt.Sprintf("ツール: %s / %s\n登録先: %s\n登録名: %s\nHost: 127.0.0.1  Port: %d\nDB: %s  User: %s\n判定: %s\n対象ツールを終了してください。パスワードは渡さず、DB接続は開始しません。\nバックアップ: %s\n", p.Target.Tool, p.Target.Version, p.Target.Store, p.Name, p.Profile.Port, p.Profile.Database, p.Profile.Username, disposition, filepath.Join(a.Paths.ConfigDir, "db-tool-backups", p.Target.Tool))
+	text := fmt.Sprintf("ツール: %s / %s\n実行ファイル: %s\n登録先: %s\n登録名: %s\nDB種別: %s\nHost: 127.0.0.1  Port: %d\nDB: %s  User: %s\n判定: %s\n対象ツールを終了してください。パスワードは渡さず、DB接続は開始しません。\nバックアップ: %s\n", p.Target.Tool, p.Target.Version, p.Target.Executable, p.Target.Store, p.Name, p.Profile.DatabaseVersion, p.Profile.Port, p.Profile.Database, p.Profile.Username, disposition, filepath.Join(a.Paths.ConfigDir, "db-tool-backups", p.Target.Tool))
 	if p.Target.Tool == "pgadmin" {
-		text += "pgAdmin所有ユーザー: " + p.Target.User + "\n"
+		text += "pgAdmin同梱Python: " + p.Target.Python + "\nsetup.py: " + p.Target.SetupScript + "\npgAdmin所有ユーザー: " + p.Target.User + "\n"
 	}
 	if p.Target.Tool == "dbeaver" {
 		text += "専用追加JSONを保存します。DBeaverでの読込みは次回起動後に確認してください。\n"
@@ -596,7 +601,7 @@ func (a *App) writeDBToolReceipt(r dbToolReceipt) error {
 	return dbToolWriteState(a.dbToolReceiptFile(), b)
 }
 func (a *App) applyDBToolRegistration(ctx context.Context, p *dbToolRegistrationPlan) (r dbToolRegistrationResult, retErr error) {
-	r = dbToolRegistrationResult{Status: "failed", Name: p.Name, Target: p.Target.Store}
+	r = dbToolRegistrationResult{Status: "failed", Name: p.Name, Target: p.Target.Store, Fingerprint: p.Fingerprint}
 	ctx, cancel := context.WithTimeout(ctx, 120*time.Second)
 	defer cancel()
 	// 保存設定の変更と登録を同じ排他内で再検査する。外部アプリには排他を強制しない。
@@ -617,7 +622,7 @@ func (a *App) applyDBToolRegistration(ctx context.Context, p *dbToolRegistration
 	if err != nil {
 		return r, err
 	}
-	if fresh.Target.Identity != p.Target.Identity || fresh.BeforeDigest != p.BeforeDigest {
+	if fresh.Target != p.Target || fresh.BeforeDigest != p.BeforeDigest {
 		return r, fmt.Errorf("確認中に登録先が変更されました。内容を確認し直してください")
 	}
 	running, err := a.dbToolIsRunning(ctx, p.Target)
@@ -648,6 +653,11 @@ func (a *App) applyDBToolRegistration(ctx context.Context, p *dbToolRegistration
 	refusePending := func() (dbToolRegistrationResult, error) {
 		r.Status = "unknown"
 		return r, fmt.Errorf("前回の登録結果が未確認です。登録先と履歴 %s を確認してください。自動再送しません", a.dbToolReceiptFile())
+	}
+	// 別内容の遅延要求を現在の一致で解消しない。指紋不明の旧記録も保守的に保持する。
+	if pending && old.Fingerprint != p.Fingerprint {
+		r.Status = "unknown"
+		return r, fmt.Errorf("前回の未確認要求と保存設定が異なります。前回要求の完了と登録先を確認するまで再送・履歴確定を行いません")
 	}
 	if pending && p.Target.Tool != "pgadmin" && fresh.Disposition != "already-present" {
 		return refusePending()

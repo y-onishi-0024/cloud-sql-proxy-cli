@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"encoding/json"
@@ -54,6 +55,10 @@ func TestDBToolRegistrationCLI(t *testing.T) {
 	if code := a.Run(context.Background(), append(args, "--dry-run")); code != 0 {
 		t.Fatalf("dry-run: %s", a.Err)
 	}
+	if !strings.Contains(a.Out.(*bytes.Buffer).String(), exe) || !strings.Contains(a.Out.(*bytes.Buffer).String(), p.DatabaseVersion) {
+		t.Fatal("実行前表示にバイナリ・DB種別がない")
+	}
+
 	if _, err := os.Stat(filepath.Join(a.Paths.ConfigDir, "db-tool-registrations.json")); !os.IsNotExist(err) {
 		t.Fatal("dry-runで履歴を書いた")
 	}
@@ -361,7 +366,7 @@ func TestDBToolRegistrationDBeaverPackage(t *testing.T) {
 
 // 保存形式が不明なA5には要求せず、確認できる形式だけを追加する。
 func TestDBToolRegistrationA5Store(t *testing.T) {
-	for _, kind := range []string{"empty", "binary", "unknown-string", "valid", "pending-saved", "x86"} {
+	for _, kind := range []string{"empty", "binary", "unknown-string", "valid", "pending-saved", "pending-other-exe", "x86"} {
 		t.Run(kind, func(t *testing.T) {
 			a, p, _, _ := dbToolFixture(t)
 			a.OS, a.Arch = "windows", "amd64"
@@ -422,8 +427,32 @@ func TestDBToolRegistrationA5Store(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			if kind == "pending-other-exe" {
+				if err := a.writeDBToolReceipt(dbToolReceipt{Version: 1, Entries: map[string]dbToolRegistrationResult{plan.ID: {Status: "unknown", Submitted: true, Fingerprint: dbToolHash(p)}}}); err != nil {
+					t.Fatal(err)
+				}
+				otherExe := filepath.Join(filepath.Dir(exe), "another", "A5M2.exe")
+				if err := os.MkdirAll(filepath.Dir(otherExe), 0700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(otherExe, image, 0700); err != nil {
+					t.Fatal(err)
+				}
+				other, err := a.planDBToolRegistration(context.Background(), p, dbToolOptions{Tool: "a5", Executable: otherExe})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if other.ID != plan.ID {
+					t.Fatal("実行ファイルだけの変更で履歴IDが変わった")
+				}
+				r, err := a.applyDBToolRegistration(context.Background(), other)
+				if err == nil || r.Submitted || r.Status != "unknown" || len(snapshot.Values) != 1 {
+					t.Fatalf("exe変更でunknown要求を再送 %+v %v", r, err)
+				}
+				return
+			}
 			if kind == "pending-saved" {
-				if err := a.writeDBToolReceipt(dbToolReceipt{Version: 1, Entries: map[string]dbToolRegistrationResult{plan.ID: {Status: "unknown", Submitted: true, Backup: "previous-backup"}}}); err != nil {
+				if err := a.writeDBToolReceipt(dbToolReceipt{Version: 1, Entries: map[string]dbToolRegistrationResult{plan.ID: {Status: "unknown", Submitted: true, Backup: "previous-backup", Fingerprint: dbToolHash(p)}}}); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -455,7 +484,7 @@ func TestDBToolRegistrationDBeaverPending(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := a.writeDBToolReceipt(dbToolReceipt{Version: 1, Entries: map[string]dbToolRegistrationResult{plan.ID: {Status: "unknown", Committed: true, Backup: r.Backup}}}); err != nil {
+	if err := a.writeDBToolReceipt(dbToolReceipt{Version: 1, Entries: map[string]dbToolRegistrationResult{plan.ID: {Status: "unknown", Committed: true, Backup: r.Backup, Fingerprint: dbToolHash(p)}}}); err != nil {
 		t.Fatal(err)
 	}
 	plan, err = a.planDBToolRegistration(context.Background(), p, plan.Options)
@@ -471,7 +500,7 @@ func TestDBToolRegistrationDBeaverPending(t *testing.T) {
 		t.Fatal("履歴が解決されない")
 	}
 	// 通常のCLI再実行も、表示だけでなくunknown履歴を再送なしで解消する。
-	history.Entries[plan.ID] = dbToolRegistrationResult{Status: "unknown", Committed: true, Backup: r.Backup}
+	history.Entries[plan.ID] = dbToolRegistrationResult{Status: "unknown", Committed: true, Backup: r.Backup, Fingerprint: dbToolHash(p)}
 	if err := a.writeDBToolReceipt(history); err != nil {
 		t.Fatal(err)
 	}
@@ -488,6 +517,30 @@ func TestDBToolRegistrationDBeaverPending(t *testing.T) {
 	if string(before) != string(after) || history.Entries[plan.ID].Submitted {
 		t.Fatal("再照合で外部変更を再送")
 	}
+	// 現在の実保存先が一致していても、別内容の遅延要求を解決済みにしない。
+	previous := p
+	previous.Database = "previous_database"
+	pending := dbToolRegistrationResult{Status: "unknown", Submitted: true, Fingerprint: dbToolHash(previous), Backup: r.Backup}
+	history.Entries[plan.ID] = pending
+	if err := a.writeDBToolReceipt(history); err != nil {
+		t.Fatal(err)
+	}
+	if code := a.Run(context.Background(), []string{"profile", "register", p.Name, "--tool", "dbeaver", "--executable", exe, "--dbeaver-workspace", w}); code == 0 {
+		t.Fatal("別設定の遅延要求を現在の一致で解消")
+	}
+	history, err = a.readDBToolReceipt()
+	if err != nil || history.Entries[plan.ID].Status != "unknown" || history.Entries[plan.ID].Fingerprint != pending.Fingerprint {
+		t.Fatal("元の未確認要求を失った")
+	}
+	after, _ = os.ReadFile(files[0])
+	if string(before) != string(after) {
+		t.Fatal("異なる要求の拒否時に外部設定を変更")
+	}
+	blocked, err := a.applyDBToolRegistration(context.Background(), plan)
+	if err == nil || blocked.Submitted || blocked.Committed || blocked.Status != "unknown" {
+		t.Fatalf("別内容の要求を確定/再送した %+v %v", blocked, err)
+	}
+
 }
 
 func TestDBToolRegistrationWindowsPGAdminDetection(t *testing.T) {
