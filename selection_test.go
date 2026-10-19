@@ -117,7 +117,7 @@ func runUIFixture() int {
 			writeJSON(filepath.Join(a.Paths.ConfigDir, "binary-install.json"), binaryReceipt{hex.EncodeToString(sum[:])})
 		}
 		a.Executable = func() (string, error) { return managed, nil }
-		os.Setenv("CSQL_TEST_SELF_UPDATE_VERSION", "0.9.0")
+		os.Setenv("CSQL_TEST_SELF_UPDATE_VERSION", "0.10.0")
 		if os.Getenv("CSQL_TEST_UI_UPDATED") == "1" {
 			b, _ := json.Marshal(os.Args[1:])
 			os.WriteFile(filepath.Join(root, "updated-args.json"), b, 0600)
@@ -126,11 +126,11 @@ func runUIFixture() int {
 			payload := data
 			code := 200
 			if r.URL.Host == "api.github.com" {
-				tag := "v0.9.0"
+				tag := "v0.10.0"
 				if os.Getenv("CSQL_TEST_UI_UPDATED") == "1" {
 					tag = "v" + version
 				}
-				name := "csql-0.9.0-" + a.OS + "-" + a.Arch
+				name := "csql-0.10.0-" + a.OS + "-" + a.Arch
 				if a.OS == "windows" {
 					name += ".exe"
 				}
@@ -700,7 +700,7 @@ func TestConnectUIExportUnsupportedTool(t *testing.T) {
 		p := Profile{Name: "dev", Instance: testInstance(), Database: tc.database, Username: "reader", Port: 55439}
 		p.DatabaseVersion = tc.version
 		c := &uiConnection{id: 1, attempt: 1, profile: p, running: true, progress: &connectionProgress{snapshot: connectionSnapshot{Session: SessionStatus{Port: p.Port}}}}
-		m := &connectUI{a: a, ctx: context.Background(), state: "connecting", selectedID: 1, connections: []*uiConnection{c}, selector: selector{width: 60, height: 16}, updateVersion: "v0.9.0"}
+		m := &connectUI{a: a, ctx: context.Background(), state: "connecting", selectedID: 1, connections: []*uiConnection{c}, selector: selector{width: 60, height: 16}, updateVersion: "v0.10.0"}
 		m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("e")})
 		for i := 0; i < tc.index; i++ {
 			m.Update(tea.KeyMsg{Type: tea.KeyDown})
