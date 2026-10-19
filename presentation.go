@@ -13,6 +13,7 @@ type terminalView struct {
 	width, height int
 	color         bool
 	update        string
+	updateAction  bool
 	theme         uiTheme
 }
 type terminalChoice struct {
@@ -119,6 +120,9 @@ func (v terminalView) frame(title, subtitle, badge, body string, footer []string
 			line = footer[i]
 		}
 		if i == 0 {
+			if v.updateAction {
+				line = "F2 csqlを更新  " + line
+			}
 			line = "F1 ヘルプ  " + line
 		} else {
 			ending := "Ctrl+C 終了"

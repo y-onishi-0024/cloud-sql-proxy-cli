@@ -79,6 +79,8 @@ func (h *connectionsHarness) key(key string) {
 		msg.Type = tea.KeyDown
 	case "f1":
 		msg.Type = tea.KeyF1
+	case "f2":
+		msg.Type = tea.KeyF2
 	case "ctrl+k":
 		msg.Type = tea.KeyCtrlK
 	case "up":
@@ -1078,6 +1080,70 @@ func TestConnectionsSearchRecoveryCopy(t *testing.T) {
 	}
 }
 
+// 起動直後の各一覧で、接続先を登録・選択せずに更新確認を開ける。
+func TestConnectionsTopLevelUpdate(t *testing.T) {
+	for _, tab := range []connectionTab{tabInstances, tabProfiles, tabConnections} {
+		t.Run(fmt.Sprint(tab), func(t *testing.T) {
+			a, _, _ := testApp(t)
+			selfUpdateUIFixture(t, a)
+			h := newConnectionsHarness(t, a)
+			h.m.tab = tab
+			h.m.selector.rows = nil
+			for _, width := range []int{60, 100} {
+				h.update(tea.WindowSizeMsg{Width: width, Height: 16})
+				if !strings.Contains(h.m.View(), "F2 csqlを更新") {
+					t.Fatalf("%d列の一覧に更新入口がない: %s", width, h.m.View())
+				}
+			}
+			h.key("f2")
+			if h.m.state != "updateChecking" {
+				t.Fatal("接続先なしでF2から更新を開けない", h.m.state)
+			}
+			h.pumpUntil(func() bool { return h.m.state == "updateConfirm" }, "更新確認")
+			h.key("esc")
+			if h.m.state != "list" || h.m.tab != tab || len(h.m.connections) != 0 {
+				t.Fatal("取消で元の一覧に戻らない、または接続を開始した")
+			}
+		})
+	}
+	// 入力中やヘルプ表示中は、F2で編集・表示を中断しない。
+	for _, mode := range []string{"add-only", "form", "help"} {
+		t.Run(mode, func(t *testing.T) {
+			a, _, _ := testApp(t)
+			h := newConnectionsHarness(t, a)
+			switch mode {
+			case "add-only":
+				h.m.addOnly = true
+			case "form":
+				h.m.openForm(Profile{Instance: testInstance()})
+			case "help":
+				h.key("f1")
+			}
+			before := h.m.View()
+			h.key("f2")
+			if h.m.updateJob != nil || h.m.View() != before || (mode != "help" && strings.Contains(before, "F2 csqlを更新")) {
+				t.Fatal("対象外の画面で更新を案内・開始した")
+			}
+		})
+	}
+	t.Run("search-error", func(t *testing.T) {
+		a, _, _ := testApp(t)
+		selfUpdateUIFixture(t, a)
+		h := newConnectionsHarness(t, a)
+		h.m.fail(fmt.Errorf("検索できません"), "local")
+		h.key("ctrl+l")
+		if !strings.Contains(h.m.View(), "F2 csqlを更新") {
+			t.Fatal("検索失敗時に更新の入口がない")
+		}
+		h.key("f2")
+		h.pumpUntil(func() bool { return h.m.state == "updateConfirm" }, "更新確認")
+		h.key("esc")
+		if h.m.state != "error" || !strings.Contains(h.m.View(), "検索できません") {
+			t.Fatal("更新取消で元のエラー情報が失われた")
+		}
+	})
+}
+
 // 対象行がなくても更新でき、確認/取得を取り消しても接続を維持する。
 func TestConnectionsSelfUpdate(t *testing.T) {
 	for _, mode := range []string{"decline", "cancel", "offline", "lock", "ready", "add-only"} {
@@ -1104,9 +1170,14 @@ func TestConnectionsSelfUpdate(t *testing.T) {
 				}
 				return
 			}
-			h.key("ctrl+k")
-			h.key("update")
-			h.key("enter")
+			if mode == "ready" {
+				// 従来のメニュー入口も維持する。
+				h.key("ctrl+k")
+				h.key("update")
+				h.key("enter")
+			} else {
+				h.key("f2")
+			}
 			if h.m.state != "updateChecking" {
 				t.Fatal("検索0件の共通更新が開かない", h.m.state)
 			}

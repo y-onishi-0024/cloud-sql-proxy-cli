@@ -866,6 +866,9 @@ func (m *connectUI) openHelp() {
 			lines = append(lines, "Enter 接続  Ctrl+S 保存", "Ctrl+O 保存済み設定の操作")
 		}
 	}
+	if !m.addOnly && (m.state == "list" || m.state == "error") {
+		lines = append(lines, "F2 csqlを更新（接続先の選択は不要）")
+	}
 	lines = append(lines, "F1/Esc ヘルプを閉じる", "Ctrl+C この画面の全接続停止", "コピー後は別ターミナルで実行し、戻って再試行", "DBログイン未検証")
 	var p Profile
 	var session string
@@ -888,7 +891,7 @@ func (m *connectUI) openHelp() {
 		lines = append(lines, "セッション "+session)
 	}
 	if m.updateVersion != "" {
-		lines = append(lines, "", "更新 "+m.updateVersion, "Ctrl+K → 更新でcsql内から更新", updatePage)
+		lines = append(lines, "", "更新 "+m.updateVersion, "一覧のF2、またはCtrl+K → 更新でcsql内から更新", updatePage)
 	}
 	if strings.HasPrefix(m.state, "migration") {
 		lines = append(lines, "", "移行: Enter 実行前確認 / ←→・Tab 取消と取込を選択", "PgUp/PgDn 詳細 / Esc 戻る・処理取消", "認証・PATH・未保存接続は移行しません")
@@ -1472,6 +1475,10 @@ func (m *connectUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.selector.width > 0 && (m.selector.width < 60 || m.selector.height < 16) && key != "esc" {
 			return m, nil
 		}
+		// 一覧の共通操作として、選択行や接続状態に依存せず既存の更新確認へ進む。
+		if key == "f2" && (m.state == "list" || m.state == "error") {
+			return m, m.startSelfUpdate()
+		}
 		if d, _, page := m.recovery(); d != nil && (m.state == "error" || m.state == "connecting") && (key == "pgup" || key == "pgdown") {
 			width, height := m.dimensions()
 			pageHeight := max(1, height-6)
@@ -1805,6 +1812,7 @@ func (m *connectUI) View() string {
 	if strings.HasPrefix(m.state, "migration") {
 		return m.migrationView(v, width, height, tabs)
 	}
+	v.updateAction = !m.addOnly && (m.state == "list" || m.state == "error")
 	footer := []string{"↑↓ 選択  Enter 接続  Tab 切替  Ctrl+S 保存", "Ctrl+U 消去  Ctrl+L 注意  Esc 戻る  Ctrl+C 全接続停止"}
 	if m.state == "list" {
 		tabs = m.tabsView()
